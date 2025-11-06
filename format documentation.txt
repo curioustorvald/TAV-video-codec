@@ -1,0 +1,879 @@
+TSVM Advanced Video (TAV) Format
+Created by CuriousTorvald and Claude on 2025-09-13
+
+TAV is a next-generation video codec for TSVM utilizing Discrete Wavelet Transform (DWT)
+similar to JPEG2000, providing superior compression efficiency and scalability compared
+to DCT-based codecs like TEV. Features include multi-resolution encoding, progressive
+transmission capability, and region-of-interest coding.
+
+# File Structure
+\x1F T S V M T A V (if video), \x1F T S V M T A P (if still picture)
+[HEADER]
+[PACKET 0]
+[PACKET 1]
+[PACKET 2]
+...
+
+## Header (32 bytes)
+    uint8  Magic[8]: "\x1F TSVM TAV" or "\x1F TSVM TAP"
+    uint8  Version: 3 (YCoCg-R uniform), 4 (ICtCp uniform), 5 (YCoCg-R perceptual), 6 (ICtCp perceptual)
+    uint16 Width: video width in pixels
+    uint16 Height: video height in pixels
+    uint8  FPS: frames per second. Use 0x00 for still images
+    uint32 Total Frames: number of video frames
+            - use 0 to denote not-finalised video stream
+            - use 0xFFFFFFFF to denote still image
+    uint8  Wavelet Filter Type:
+            - 0 = 5/3 reversible (LGT 5/3, JPEG 2000 standard)
+            - 1 = 9/7 irreversible (CDF 9/7, slight modification of JPEG 2000, default choice)
+            - 2 = CDF 13/7 (experimental)
+            - 16 = DD-4 (Four-point interpolating Deslauriers-Dubuc; experimental)
+            - 255 = Haar (demonstration purpose only)
+    uint8  Decomposition Levels: number of DWT levels (1-6+)
+    uint8  Quantiser Index for Y channel (uses exponential numeric system; 0: lossless, 255: potato)
+    uint8  Quantiser Index for Co channel (uses exponential numeric system; 0: lossless, 255: potato)
+    uint8  Quantiser Index for Cg channel (uses exponential numeric system; 0: lossless, 255: potato)
+    uint8  Extra Feature Flags (must be ignored for still images)
+            - bit 0 = has audio
+            - bit 1 = has subtitle
+            - bit 2 = infinite loop (must be ignored when File Role is 1)
+            - bit 7 = has no actual packets, this file is header-only without an Intro Movie
+    uint8  Video Flags
+            - bit 0 = interlaced
+            - bit 1 = is NTSC framerate
+            - bit 2 = is lossless mode
+                (shorthand for `-q 6 -Q0,0,0 -w 0 --intra-only --no-perceptual-tuning --arate 384`)
+            - bit 3 = has region-of-interest coding (for still images only)
+    uint8  Encoder quality level (stored with bias of 1 (q0=1); used to derive anisotropy value)
+    uint8  Channel layout (bit-field: bit 0=has alpha, bit 1=has chroma inverted, bit 2=has luma inverted)
+            - 0 = Y-Co-Cg/I-Ct-Cp (000: no alpha, has chroma, has luma)
+            - 1 = Y-Co-Cg-A/I-Ct-Cp-A (001: has alpha, has chroma, has luma)
+            - 2 = Y/I only (010: no alpha, no chroma, has luma)
+            - 3 = Y-A/I-A (011: has alpha, no chroma, has luma)
+            - 4 = Co-Cg/Ct-Cp (100: no alpha, has chroma, no luma)
+            - 5 = Co-Cg-A/Ct-Cp-A (101: has alpha, has chroma, no luma)
+            - 6-7 = Reserved/invalid (would indicate no luma and no chroma)
+    uint8  Entropy Coder
+            - 0 = Twobit-plane significance map
+            - 1 = Embedded Zero Block Coding
+            - 2 = Raw coefficients
+    uint8  Reserved[2]: fill with zeros
+    uint8  Device Orientation
+            - 0 = No rotation
+            - 1 = Clockwise 90 deg
+            - 2 = 180 deg
+            - 3 = Clockwise 270 deg
+            - 4 = Mirrored, No rotation
+            - 5 = Mirrored, Clockwise 90 deg
+            - 6 = Mirrored, 180 deg
+            - 7 = Mirrored, Clockwise 270 deg
+    uint8  File Role
+            - 0 = generic
+            - 1 = this file is header-only, and UCF payload will be followed (used by movie file with chapters)
+                   When header-only file contain video packets, they should be presented as an Intro Movie
+                   before the user-interactable selector (served by the UCF payoad)
+
+## Packet Structure (some special packets have no payload. See Packet Types for details)
+    uint8  Packet Type
+    uint32 Payload Size
+    *      Payload
+
+## Packet Types
+    <video packets>
+    0x10: I-frame (intra-coded frame)
+    0x11: P-frame (delta/skip frame)
+    0x12: GOP Unified (temporal 3D DWT with unified preprocessing)
+    0x1F: (prohibited)
+    <audio packets>
+    0x20: MP2 audio packet (32 KHz)
+    0x21: Zstd-compressed 8-bit PCM (32 KHz, audio hardware's native format)
+    0x22: Zstd-compressed 16-bit PCM (32 KHz, little endian)
+    0x23: Zstd-compressed ADPCM (32 KHz)
+    0x24: TAD (TSVM Advanced Audio)
+    <subtitles>
+    0x30: Subtitle in "Simple" format
+    0x31: Subtitle in "Simple" format with timecodes
+    0x32: Subtitle in "Karaoke" format
+    0x33: Subtitle in "Karaoke" format with timecodes
+    <synchronised tracks>
+    0x40: MP2 audio track (32 KHz)
+    0x41: Zstd-compressed 8-bit PCM (32 KHz, audio hardware's native format)
+    0x42: Zstd-compressed 16-bit PCM (32 KHz, little endian)
+    0x43: Zstd-compressed ADPCM (32 KHz)
+    0x44: TAD (TSVM Advanced Audio)
+    <multiplexed video>
+    0x70..7F: Reserved for Future Version
+    <Standard metadata payloads>
+    (it's called "standard" because you're expected to just copy-paste the metadata bytes verbatim)
+    0xE0: EXIF packet
+    0xE1: ID3v1 packet
+    0xE2: ID3v2 packet
+    0xE3: Vorbis Comment packet
+    0xE4: CD-text packet
+    <Special packets>
+    0x00: No-op (no payload)
+    0xEF: TAV Extended Header
+    0xF0: Loop point start (insert right AFTER the TC packet; no payload)
+    0xF1: Loop point end (insert right AFTER the TC packet; no payload)
+    0xFC: GOP Sync packet (indicates N frames decoded from GOP block)
+    0xFD: Timecode (TC) Packet [for frame 0, insert at the beginning; otherwise, insert right AFTER the sync]
+    0xFE: NTSC sync packet (used by player to calculate exact framerate-wise performance; no payload)
+    0xFF: Sync packet (no payload)
+
+    ### Packet Precedence
+
+        Before the first frame group:
+        1. TAV Extended header (if any)
+        2. Standard metadata payloads (if any)
+        3. SSF-TC/KSF-TC packets (if any)
+            When time-coded subtitles are used, the entire subtitle bytes must precede the first video frame.
+            Think of it as tacking the whole subtitle file before the actual video.
+
+        Frame group:
+        1. TC Packet (0xFD) or Next TAV File (0x1F) [mutually exclusive!]
+        2. Loop point packet (if any)
+        3. Audio packets (if any)
+        4. Subtitle packets (if any) [mutually exclusive with SSF-TC/KSF-TC packets]
+        5. Main video packets (0x10-0x1E)
+        6. Multiplexed video packets (0x70-7F; if any)
+
+        After a frame group:
+        1. Sync packet
+
+
+## TAV Extended Header Specification and Structure
+    uint8  0xEF
+    uint16 Number of Key-Value pairs
+    *      Key-Value pairs
+
+    ### Key-Value Pair
+    uint8  Key[4]
+    uint8  Value Type
+           - 0x00: (U)Int16
+           - 0x01: (U)Int24
+           - 0x02: (U)Int32
+           - 0x03: (U)Int48
+           - 0x04: (U)Int64
+           - 0x10: Bytes
+    <if Value Type is Bytes>
+    uint16 Length of bytes
+    *      Bytes
+    <otherwise>
+    type_t Value
+
+    ### List of Keys
+    - Uint64 BGNT: Video begin time in nanoseconds (must be equal to the value of the first Timecode packet)
+    - Uint64 ENDT: Video end time in nanoseconds (must be equal to the value of the last Timecode packet)
+    - Uint64 CDAT: Creation time in microseconds since UNIX Epoch (must be in UTC timezone)
+    - Bytes VNDR: Name and version of the encoder (for Reference encoder: "Encoder-TAV 20251014 (list,of,features)")
+    - Bytes FMPG: FFmpeg version (typically "ffmpeg version 8.0 Copyright (c) 2000-2025 the FFmpeg developers"; the first line of text FFmpeg emits)
+
+
+## Standard Metadata Payload Packet Structure
+    uint8  0xE0/0xE1/0xE2/.../0xEE (see Packet Types section)
+    uint32 Length of the payload
+    *      Standard payload
+
+    Notes:
+    - metadata packets must precede any non-metadata packets
+    - when multiple metadata packets are present (e.g. ID3v2 and Vorbis Comment both present),
+      which gets precedence is implementation-dependent. ONE EXCEPTION is ID3v1 and ID3v2 where ID3v2 gets
+      precedence.
+
+## Timecode Packet Structure
+    uint8  Packet Type (0xFE)
+    uint64 Time since stream start in nanoseconds (this may NOT start from zero if the video is coming from a livestream)
+
+## Video Packet Structure (0x10, 0x11)
+    uint8  Packet Type
+    uint32 Compressed Size
+    *      Zstd-compressed Block Data
+
+## TAD Packet Structure
+    uint8  Packet type (0x24)
+    <header for decoding packet>
+    uint16 Sample Count
+    uint32 Compressed Size + 7
+    <header for decoding TAD chunk>
+    uint16 Sample Count
+    uint8  Quantiser Bits
+    uint32 Compressed Size
+    *      Zstd-compressed TAD
+
+## GOP Unified Packet Structure (0x12)
+Implemented on 2025-10-15 for temporal 3D DWT with unified preprocessing.
+
+This packet contains multiple frames encoded as a single spacetime block for optimal
+temporal compression.
+
+    uint8  Packet Type
+    uint8  GOP Size (number of frames in this GOP)
+    uint32 Compressed Size
+    *      Zstd-compressed Unified Block Data
+
+### Unified Block Data Format
+The entire GOP (width×height×N_frames×3_channels) is preprocessed as a single block:
+
+    <if significance maps are used>
+    uint8  Y Significance Maps[(width*height + 7) / 8 * GOP Size]     // All Y frames concatenated
+    uint8  Co Significance Maps[(width*height + 7) / 8 * GOP Size]    // All Co frames concatenated
+    uint8  Cg Significance Maps[(width*height + 7) / 8 * GOP Size]    // All Cg frames concatenated
+    int16  Y Non-zero Values[variable length]                          // All Y non-zero coefficients
+    int16  Co Non-zero Values[variable length]                         // All Co non-zero coefficients
+    int16  Cg Non-zero Values[variable length]                         // All Cg non-zero coefficients
+
+    <if EZBC is used>
+    uint32 EZBC Size for Y
+    *      EZBC Structure for Y
+    uint32 EZBC Size for Co
+    *      EZBC Structure for Co
+    uint32 EZBC Size for Cg
+    *      EZBC Structure for Cg
+
+This layout enables Zstd to find patterns across both spatial and temporal dimensions,
+resulting in superior compression compared to per-frame encoding.
+
+### Temporal 3D DWT Process
+1. Detect where the scene change is happening on the first pass
+2. Determine GOP slicing from the scene detection
+3. Apply 1D DWT across temporal axis (GOP frames)
+4. Apply 2D DWT on each spatial slice of temporal subbands
+5. Perceptual quantization with temporal-spatial awareness
+6. Unified significance map preprocessing across all frames/channels
+7. Single Zstd compression of entire GOP block
+
+## GOP Sync Packet Structure (0xFC)
+Indicates that N frames were decoded from a GOP Unified block.
+Decoders must track this to maintain proper frame count and synchronization.
+
+    uint8  Packet Type (0xFC)
+    uint8  Frame Count (number of frames that were decoded from preceding GOP block)
+
+Note: GOP Sync packets have no payload size field (fixed 2-byte packet).
+
+## Block Data (per frame)
+    uint8  Mode: encoding mode
+            0x00 = SKIP (just use frame data from previous frame)
+            0x01 = INTRA (DWT-coded)
+            0x02 = DELTA (DWT delta)
+            - 0x02: DWT level 1
+            - 0x12: DWT level 2
+            - 0x22: DWT level 3
+              ...
+            - 0xF2: DWT Level 16
+    uint8  Quantiser override Y  (uses exponential numeric system; stored with index bias of 1 (127->252, 255->4032); use 0 to disable overriding)
+    uint8  Quantiser override Co (uses exponential numeric system; stored with index bias of 1 (127->252, 255->4032); use 0 to disable overriding)
+    uint8  Quantiser override Cg (uses exponential numeric system; stored with index bias of 1 (127->252, 255->4032); use 0 to disable overriding)
+        - note: quantiser overrides are always present regardless of the channel layout
+    *       Tile data (one compressed payload per tile)
+
+    ### Coefficient Storage Format (Significance Map Compression)
+
+    Starting with encoder version 2025-09-29, DWT coefficients are stored using
+    significance map compression with concatenated maps layout for optimal efficiency:
+
+    #### Concatenated Maps Format
+    All channels are processed together to maximize Zstd compression:
+
+        uint8  Y Significance Map[(coeff_count + 7) / 8]    // 1 bit per Y coefficient
+        uint8  Co Significance Map[(coeff_count + 7) / 8]   // 1 bit per Co coefficient
+        uint8  Cg Significance Map[(coeff_count + 7) / 8]   // 1 bit per Cg coefficient
+        uint8  A Significance Map[(coeff_count + 7) / 8]    // 1 bit per A coefficient (if alpha present)
+        int16  Y Non-zero Values[variable length]           // Only non-zero Y coefficients
+        int16  Co Non-zero Values[variable length]          // Only non-zero Co coefficients
+        int16  Cg Non-zero Values[variable length]          // Only non-zero Cg coefficients
+        int16  A Non-zero Values[variable length]           // Only non-zero A coefficients (if alpha present)
+
+    #### Significance Map Encoding
+    Each significance map uses 1 bit per coefficient position:
+        - Bit = 1: coefficient is non-zero, read value from corresponding Non-zero Values array
+        - Bit = 0: coefficient is zero
+
+    #### Compression Benefits
+    - **Sparsity exploitation**: Typically 85-95% zeros in quantised DWT coefficients
+    - **Cross-channel patterns**: Concatenated maps allow Zstd to find patterns across similar significance maps
+    - **Overall improvement**: 16-18% compression improvement before Zstd compression
+
+## DWT Implementation Details
+
+### Wavelet Filters
+- 5/3 Reversible Filter (lossless capable):
+  * Analysis: Low-pass [1/2, 1, 1/2], High-pass [-1/8, -1/4, 3/4, -1/4, -1/8]
+  * Synthesis: Low-pass [1/4, 1/2, 1/4], High-pass [-1/16, -1/8, 3/8, -1/8, -1/16]
+
+- 9/7 Irreversible Filter (higher compression):
+  * Analysis: CDF 9/7 coefficients optimized for image compression
+  * Provides better energy compaction than 5/3 but lossy reconstruction
+
+### Quantisation Strategy
+
+#### Uniform Quantisation (Versions 3-4)
+Traditional approach using same quantisation factor for all DWT subbands within each channel.
+
+#### Perceptual Quantisation (Versions 5-6, Default)
+TAV versions 5 and 6 implement Human Visual System (HVS) optimized quantisation with
+frequency-aware subband weighting for superior visual quality:
+
+Anisotropic quantisation is applied for both Luma and Chroma channels to preserve horizontal details.
+The anisotropic quantisation is the innovative upgrade to the traditional field-interlacing and
+chroma subsampling.
+
+This perceptual approach allocates more bits to visually important low-frequency
+details while aggressively quantising high-frequency noise, resulting in superior
+visual quality at equivalent bitrates.
+
+#### Grain Synthesis
+
+The decoder must synthesise a film grain on non-LL subbands at the amplitude half of the quantisation level.
+The encoder may synthesise the exact same grain in sign-reversed on encoding (but not recommended for practical reasons).
+
+The base noise function must be triangular noise in range [-1.0, 1.0].
+
+## Colour Space
+TAV supports two colour spaces:
+
+**YCoCg-R (Versions 3, 5):**
+- Y: Luma channel (full resolution)
+- Co: Orange-Cyan chroma (full resolution)
+- Cg: Green-Magenta chroma (full resolution)
+
+**ICtCp (Versions 4, 6):**
+- I: Intensity (similar to luma)
+- Ct: Chroma tritanopia
+- Cp: Chroma protanopia
+
+Perceptual versions (5-6) apply HVS-optimized quantisation weights per channel,
+while uniform versions (3-4) use consistent quantisation across all subbands.
+
+The encoder expects linear alpha.
+
+## Compression Features
+- Single DWT tiles
+- Multi-resolution representation enables scalable decoding
+- Better frequency localization than DCT
+- Reduced blocking artifacts due to overlapping basis functions
+
+## Audio Support
+MP2 frames, raw PCMu8, and TAD formats are supported.
+
+## Subtitle Support
+Uses same Simple Subtitle Format (SSF) as TEV for text overlay functionality.
+
+## NTSC Framerate handling
+Unlike the TEV format, TAV encoder emits extra sync packet for every 1000th frames. Decoder can just play the video without any special treatment.
+
+## Exponential Numeric System
+This system maps [0..255] to [1..4096]
+
+Number|Index
+------+-----
+1|0
+2|1
+3|2
+4|3
+5|4
+6|5
+7|6
+8|7
+9|8
+10|9
+11|10
+12|11
+13|12
+14|13
+15|14
+16|15
+17|16
+18|17
+19|18
+20|19
+21|20
+22|21
+23|22
+24|23
+25|24
+26|25
+27|26
+28|27
+29|28
+30|29
+31|30
+32|31
+33|32
+34|33
+35|34
+36|35
+37|36
+38|37
+39|38
+40|39
+41|40
+42|41
+43|42
+44|43
+45|44
+46|45
+47|46
+48|47
+49|48
+50|49
+51|50
+52|51
+53|52
+54|53
+55|54
+56|55
+57|56
+58|57
+59|58
+60|59
+61|60
+62|61
+63|62
+64|63
+66|64
+68|65
+70|66
+72|67
+74|68
+76|69
+78|70
+80|71
+82|72
+84|73
+86|74
+88|75
+90|76
+92|77
+94|78
+96|79
+98|80
+100|81
+102|82
+104|83
+106|84
+108|85
+110|86
+112|87
+114|88
+116|89
+118|90
+120|91
+122|92
+124|93
+126|94
+128|95
+132|96
+136|97
+140|98
+144|99
+148|100
+152|101
+156|102
+160|103
+164|104
+168|105
+172|106
+176|107
+180|108
+184|109
+188|110
+192|111
+196|112
+200|113
+204|114
+208|115
+212|116
+216|117
+220|118
+224|119
+228|120
+232|121
+236|122
+240|123
+244|124
+248|125
+252|126
+256|127
+264|128
+272|129
+280|130
+288|131
+296|132
+304|133
+312|134
+320|135
+328|136
+336|137
+344|138
+352|139
+360|140
+368|141
+376|142
+384|143
+392|144
+400|145
+408|146
+416|147
+424|148
+432|149
+440|150
+448|151
+456|152
+464|153
+472|154
+480|155
+488|156
+496|157
+504|158
+512|159
+528|160
+544|161
+560|162
+576|163
+592|164
+608|165
+624|166
+640|167
+656|168
+672|169
+688|170
+704|171
+720|172
+736|173
+752|174
+768|175
+784|176
+800|177
+816|178
+832|179
+848|180
+864|181
+880|182
+896|183
+912|184
+928|185
+944|186
+960|187
+976|188
+992|189
+1008|190
+1024|191
+1056|192
+1088|193
+1120|194
+1152|195
+1184|196
+1216|197
+1248|198
+1280|199
+1312|200
+1344|201
+1376|202
+1408|203
+1440|204
+1472|205
+1504|206
+1536|207
+1568|208
+1600|209
+1632|210
+1664|211
+1696|212
+1728|213
+1760|214
+1792|215
+1824|216
+1856|217
+1888|218
+1920|219
+1952|220
+1984|221
+2016|222
+2048|223
+2112|224
+2176|225
+2240|226
+2304|227
+2368|228
+2432|229
+2496|230
+2560|231
+2624|232
+2688|233
+2752|234
+2816|235
+2880|236
+2944|237
+3008|238
+3072|239
+3136|240
+3200|241
+3264|242
+3328|243
+3392|244
+3456|245
+3520|246
+3584|247
+3648|248
+3712|249
+3776|250
+3840|251
+3904|252
+3968|253
+4032|254
+4096|255
+
+
+--------------------------------------------------------------------------------
+
+TSVM Advanced Audio (TAD) Format
+Created by CuriousTorvald and Claude on 2025-10-23
+Updated: 2025-10-30 (fixed non-power-of-2 sample count support)
+
+TAD is a perceptual audio codec for TSVM utilizing Discrete Wavelet Transform (DWT)
+with CDF 9/7 biorthogonal wavelets, providing efficient compression through M/S stereo
+decorrelation, frequency-dependent quantization, and raw int8 coefficient storage.
+Designed as an includable API for integration with TAV video encoder.
+
+When used inside of a video codec, only zstd-compressed payload is stored, chunk length
+is stored separately and quality index is shared with that of the video.
+
+# Suggested File Structure
+\x1F T S V M T A D
+[HEADER]
+[CHUNK 0]
+[CHUNK 1]
+[CHUNK 2]
+...
+
+## Header (16 bytes)
+    uint8  Magic[8]: "\x1F TSVM TAD"
+    uint8  Version: 1
+    uint8  Quality Level: 0-5 (0=lowest quality/smallest, 5=highest quality/largest)
+    uint8  Flags:
+            - bit 0: Zstd compression enabled (1=compressed, 0=uncompressed)
+            - bits 1-7: Reserved (must be 0)
+    uint32 Sample Rate: audio sample rate in Hz (always 32000 for TSVM)
+    uint8  Channels: number of audio channels (always 2 for stereo)
+    uint8  Reserved[2]: fill with zeros
+
+## Audio Properties
+- **Sample Rate**: 32000 Hz (TSVM audio hardware native format)
+- **Channels**: 2 (stereo)
+- **Input Format**: PCM32fLE (32-bit float little-endian PCM)
+- **Preprocessing**: 16 Hz highpass filter applied during extraction
+- **Internal Representation**: Float32 throughout encoding, PCM8 conversion only at decoder
+- **Chunk Size**: Variable (1024-32768+ samples per channel, any size ≥1024 supported)
+  - Default: 32768 samples (1.024 seconds at 32 kHz) for standalone files
+  - TAV integration: Uses exact GOP sample count (e.g., 32016 for 1 second at 32 kHz)
+  - Minimum: 1024 samples (32 ms at 32 kHz)
+  - DWT levels: Fixed at 9 levels for all chunk sizes
+- **Target Compression**: 2:1 against PCMu8 baseline
+- **Wavelet**: CDF 9/7 biorthogonal
+
+## Chunk Structure
+Each chunk encodes a variable number of stereo samples (minimum 1024, any size supported).
+Default is 32768 samples (65536 total samples, 1.024 seconds) for standalone files.
+TAV integration uses exact GOP sample counts (e.g., 32016 samples for 1 second at 32 kHz).
+
+    uint16 Sample Count: number of samples per channel (min 1024, any size ≥1024)
+    uint8  Max quantisation index: this number * 2 + 1 is the total steps of quantisation
+    uint32 Chunk Payload Size: size of following payload in bytes
+    *      Chunk Payload: encoded M/S stereo data (Zstd compressed if flag set)
+
+### Chunk Payload Structure (before optional Zstd compression)
+    *      Mid Channel Encoded Data (raw int8 values)
+    *      Side Channel Encoded Data (raw int8 values)
+
+## Encoding Pipeline
+
+### Step 1: Dynamic Range Compression (Gamma Compression)
+Input stereo PCM32fLE undergoes gamma compression for perceptual uniformity:
+
+    encode(x) = sign(x) * |x|^γ  where γ=0.707 (1/√2)
+
+This compresses dynamic range before quantization, improving perceptual quality.
+
+### Step 2: M/S Stereo Decorrelation
+Mid-Side transformation exploits stereo correlation:
+
+    Mid = (Left + Right) / 2
+    Side = (Left - Right) / 2
+
+This typically concentrates energy in the Mid channel while the Side channel
+contains mostly small values, improving compression efficiency.
+
+### Step 3: 9-Level CDF 9/7 DWT
+Each channel (Mid and Side) undergoes CDF 9/7 biorthogonal wavelet decomposition. The codec uses a fixed 9 decomposition levels for all chunk sizes:
+
+    DWT Levels = 9 (fixed)
+
+For 32768-sample chunks:
+    - After 9 levels: 64 LL coefficients
+    - Frequency subbands: LL + 9 H bands (L9 to L1)
+
+For 32016-sample chunks (TAV 1-second GOP):
+    - After 9 levels: 63 LL coefficients
+    - Supports non-power-of-2 sizes through proper length tracking (fixed 2025-10-30)
+
+Sideband boundaries are calculated dynamically:
+    first_band_size = chunk_size >> dwt_levels
+    sideband[0] = 0
+    sideband[1] = first_band_size
+    sideband[i+1] = sideband[i] + (first_band_size << (i-1))
+
+CDF 9/7 lifting coefficients:
+    α = -1.586134342
+    β = -0.052980118
+    γ = 0.882911076
+    δ = 0.443506852
+    K = 1.230174105
+
+### Step 4: Frequency-Dependent Quantization
+DWT coefficients are quantized using perceptually-tuned frequency-dependent weights.
+
+Final quantization step: base_weight * quality_scale
+
+#### Dead Zone Quantization
+High-frequency coefficients (Level 0: 8-16 KHz) use dead zone quantization
+where coefficients smaller than half the quantization step are zeroed:
+
+    if (abs(coefficient) < quantization_step / 2)
+        coefficient = 0
+
+This aggressively removes high-frequency noise while preserving important
+mid-frequency content (2-4 KHz critical for speech intelligibility).
+
+### Step 5: Raw Int8 Coefficient Storage
+Quantized coefficients are stored directly as signed int8 values (no significance map, better Zstd compression).
+Concatenated format: [Mid_channel_data][Side_channel_data]
+
+### Step 6: Coefficient-Domain Dithering (Encoder)
+Light triangular dithering (±0.5 quantization steps) added to coefficients before
+quantization to reduce banding artifacts.
+
+### Step 7: Zstd Compression
+The concatenated Mid+Side encoded data is compressed
+using Zstd level 7 for additional compression without significant CPU overhead.
+
+## Decoding Pipeline
+
+### Step 1: Chunk Extraction and Decompression
+Read chunk header (sample_count, max_index, payload_size).
+If compressed (default), decompress payload using Zstd.
+
+### Step 2: Coefficient Extraction
+Extract Mid and Side channel int8 data from concatenated payload:
+    - Mid channel: bytes [0..sample_count-1]
+    - Side channel: bytes [sample_count..2*sample_count-1]
+
+### Step 3: Dequantization with Lambda Decompanding
+Convert quantized int8 values back to float coefficients using:
+    1. Lambda decompanding (inverse of Laplacian CDF compression)
+    2. Multiply by frequency-dependent quantization steps
+    3. Apply coefficient-domain dithering (TPDF, ~-60 dBFS)
+
+### Step 4: 9-Level Inverse CDF 9/7 DWT
+Reconstruct Float32 audio from DWT coefficients using inverse CDF 9/7 transform.
+
+**Critical Implementation (Fixed 2025-10-30)**:
+The multi-level inverse DWT must use the EXACT sequence of lengths from forward
+transform, in reverse order. Using simple doubling (length *= 2) is INCORRECT
+for non-power-of-2 sizes.
+
+Correct approach:
+    1. Pre-calculate all forward transform lengths:
+       lengths[0] = chunk_size
+       lengths[i] = (lengths[i-1] + 1) / 2  for i=1..9
+    2. Apply inverse DWT in reverse order:
+       for level from 8 down to 0:
+           apply inverse_dwt(data, lengths[level])
+
+This ensures correct reconstruction for all chunk sizes including non-power-of-2
+values (e.g., 32016 samples for TAV 1-second GOPs).
+
+### Step 5: M/S to L/R Conversion
+Convert Mid/Side back to Left/Right stereo:
+
+    Left = Mid + Side
+    Right = Mid - Side
+
+### Step 6: Gamma Expansion
+Expand dynamic range (inverse of encoder's gamma compression):
+
+    decode(y) = sign(y) * |y|^(1/γ)  where γ=0.707, so 1/γ=√2≈1.414
+
+### Step 7: PCM32f to PCM8 Conversion with Noise-Shaped Dithering
+Convert Float32 samples to unsigned PCM8 (PCMu8) using second-order error-diffusion
+dithering with reduced amplitude (0.2× TPDF) to coordinate with coefficient-domain
+dithering.
+
+## Compression Performance
+- **Target Ratio**: 2:1 against PCMu8
+- **Achieved Ratio**: 2.51:1 against PCMu8 at quality level 3
+- **Quality**: Perceptually transparent at Q3+, preserves full 0-16 KHz bandwidth
+- **Sparsity**: 86.9% zeros in Mid channel, 97.8% in Side channel (typical)
+
+## Integration with TAV Encoder
+TAD is designed as an includable API for TAV video encoder integration.
+The encoder can be invoked programmatically to compress audio tracks:
+
+    #include "tad_encoder.h"
+
+    size_t encoded_size = tad_encode_from_file(
+        input_audio_path,
+        output_tad_path,
+        quality_level,
+        use_zstd,
+        verbose
+    );
+
+This allows TAV video files to embed TAD-compressed audio using packet type 0x24.
+
+## Audio Extraction Command
+TAD encoder uses two-pass FFmpeg extraction for optimal quality:
+
+    # Pass 1: Extract at original sample rate
+    ffmpeg -i input.mp4 -f f32le -ac 2 temp.pcm
+
+    # Pass 2: High-quality resample with SoXR and highpass filter
+    ffmpeg -f f32le -ar {original_rate} -ac 2 -i temp.pcm \
+           -ar 32000 -af "aresample=resampler=soxr:precision=28:cutoff=0.99,highpass=f=16" \
+           output.pcm
+
+This ensures resampling happens after extraction with optimal quality parameters.
+
+--------------------------------------------------------------------------------
+
+Simple Subtitle Format (SSF)
+
+SSF is a simple subtitle that is intended to use text buffer to display texts.
+The format is designed to be compatible with SubRip and SAMI (without markups) and interoperable with
+TEV and TAV formats.
+
+SSF-TC is an SSF with extra timecode so that subtitle packets can be desynchronised with video frames
+on encoding.
+
+When SSF is interleaved with MP2 audio, the payload must be inserted in-between MP2 frames.
+
+## Packet Structure
+    uint8  0x30/0x31 (SSF/SSF-TC)
+    uint32 Packet Size
+    *      SSF Payload (see below)
+
+## SSF Packet Structure
+    uint24 Subtitle object ID (used to specify target subtitle object)
+    uint64 Timecode in nanoseconds (only present on SSF-TC format; regular SSF must not write these bytes)
+    uint8 opcode
+          0x00 = <argument terminator>, is NOP when used here
+          0x01 = show (arguments: UTF-8 text)
+          0x02 = hide (arguments: none)
+          0x03 = move to different nonant (arguments: 0x00-bottom centre; 0x01-bottom left; 0x02-centre left; 0x03-top left; 0x04-top centre; 0x05-top right; 0x06-centre right; 0x07-bottom right; 0x08-centre
+          0x10..0x2F = show in alternative languages (arguments: char[5] language code, UTF-8 text)
+          0x80 = upload to low font rom (arguments: uint16 payload length, var bytes)
+          0x81 = upload to high font rom (arguments: uint16 payload length, var bytes)
+            note: changing the font rom will change the appearance of the every subtitle currently being displayed
+    *    arguments separated AND terminated by 0x00
+            text argument may be terminated by 0x00 BEFORE the entire arguments being terminated by 0x00,
+            leaving extra 0x00 on the byte stream. A decoder must be able to handle the extra zeros.

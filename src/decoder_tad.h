@@ -25,7 +25,7 @@
  *
  * Input format:
  *   uint16 sample_count (samples per channel)
- *   uint8  max_index (maximum quantization index)
+ *   uint8  max_index (maximum quantisation index)
  *   uint32 payload_size (bytes in payload)
  *   *      payload (encoded M/S data, Zstd-compressed with EZBC)
  *

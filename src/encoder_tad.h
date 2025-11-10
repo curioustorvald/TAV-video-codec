@@ -13,17 +13,15 @@
 #define TAD32_MIN_CHUNK_SIZE 1024       // Minimum: 1024 samples
 #define TAD32_SAMPLE_RATE 32000
 #define TAD32_CHANNELS 2  // Stereo
-#define TAD32_SIGMAP_2BIT 1  // 2-bit: 00=0, 01=+1, 10=-1, 11=other
 #define TAD32_QUALITY_MIN 0
 #define TAD32_QUALITY_MAX 6
 #define TAD32_QUALITY_DEFAULT 3
 #define TAD32_ZSTD_LEVEL 15
 
-
 static inline int tad32_quality_to_max_index(int quality) {
-    static const int quality_map[7] = {31, 35, 39, 47, 56, 89, 127};
+    static const int quality_map[6] = {21, 31, 44, 63, 89, 127};
     if (quality < 0) quality = 0;
-    if (quality > 6) quality = 6;
+    if (quality > 5) quality = 5;
     return quality_map[quality];
 }
 

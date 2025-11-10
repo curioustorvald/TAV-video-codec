@@ -8,6 +8,7 @@
 #include <math.h>
 #include <zstd.h>
 #include <getopt.h>
+#include "encoder_tad.h"
 
 #define DECODER_VENDOR_STRING "Decoder-TAD 20251026"
 
@@ -31,7 +32,7 @@ static const float BASE_QUANTISER_WEIGHTS[2][10] = {
     1.0f,    // H (L4) 1 khz
     1.0f,    // H (L3) 2 khz
     1.3f,    // H (L2) 4 khz
-    1.8f     // H (L1) 8 khz
+    2.0f     // H (L1) 8 khz
 },
 { // side channel
     6.0f,    // LL (L9) DC
@@ -46,7 +47,7 @@ static const float BASE_QUANTISER_WEIGHTS[2][10] = {
     3.2f     // H (L1) 8 khz
 }};
 
-#define TAD_DEFAULT_CHUNK_SIZE 32768
+#define TAD_DEFAULT_CHUNK_SIZE 31991
 #define TAD_MIN_CHUNK_SIZE 1024
 #define TAD_SAMPLE_RATE 32000
 #define TAD_CHANNELS 2
@@ -160,6 +161,59 @@ static int calculate_dwt_levels(int chunk_size) {
     }
     return levels - 2;*/
     return 9;
+}
+
+//=============================================================================
+// Stochastic Reconstruction for Deadzoned Coefficients
+//=============================================================================
+
+// Special marker for deadzoned coefficients (must match encoder)
+#define DEADZONE_MARKER_QUANT (-128)
+
+// Deadband thresholds (must match encoder)
+static const float DEADBANDS[2][10] = {
+{ // mid channel
+    0.20f,    // LL (L9) DC
+    0.06f,    // H (L9) 31.25 hz
+    0.06f,    // H (L8) 62.5 hz
+    0.06f,    // H (L7) 125 hz
+    0.06f,    // H (L6) 250 hz
+    0.04f,    // H (L5) 500 hz
+    0.04f,    // H (L4) 1 khz
+    0.01f,    // H (L3) 2 khz
+    0.01f,    // H (L2) 4 khz
+    0.01f     // H (L1) 8 khz
+},
+{ // side channel
+    0.20f,    // LL (L9) DC
+    0.06f,    // H (L9) 31.25 hz
+    0.06f,    // H (L8) 62.5 hz
+    0.06f,    // H (L7) 125 hz
+    0.06f,    // H (L6) 250 hz
+    0.04f,    // H (L5) 500 hz
+    0.04f,    // H (L4) 1 khz
+    0.01f,    // H (L3) 2 khz
+    0.01f,    // H (L2) 4 khz
+    0.01f     // H (L1) 8 khz
+}};
+
+// Fast PRNG state (xorshift32) for stochastic reconstruction
+static uint32_t deadzone_rng_state = 0x12345678u;
+
+// Laplacian-distributed noise (better approximation than TPDF)
+// Uses inverse CDF method: X = -sign(U) * ln(1 - 2*|U|) / λ
+static float laplacian_noise(float scale) {
+    float u = urand(&deadzone_rng_state) - 0.5f;  // [-0.5, 0.5)
+    float sign = (u >= 0.0f) ? 1.0f : -1.0f;
+    float abs_u = fabsf(u);
+
+    // Avoid log(0) by clamping
+    if (abs_u >= 0.49999f) abs_u = 0.49999f;
+
+    // Inverse Laplacian CDF with λ = 1/scale
+    float x = -sign * logf(1.0f - 2.0f * abs_u) * scale;
+
+    return x;
 }
 
 //=============================================================================
@@ -380,9 +434,9 @@ static void expand_gamma(float *left, float *right, size_t count) {
     for (size_t i = 0; i < count; i++) {
         // decode(y) = sign(y) * |y|^(1/γ) where γ=0.5
         float x = left[i]; float a = fabsf(x);
-        left[i] = signum(x) * powf(a, 1.4142f);
+        left[i] = signum(x) * a * a;
         float y = right[i]; float b = fabsf(y);
-        right[i] = signum(y) * powf(b, 1.4142f);
+        right[i] = signum(y) * b * b;
     }
 }
 
@@ -395,6 +449,48 @@ static void expand_mu_law(float *left, float *right, size_t count) {
         left[i] = signum(x) * (powf(1.0f + MU, fabsf(x)) - 1.0f) / MU;
         float y = right[i];
         right[i] = signum(y) * (powf(1.0f + MU, fabsf(y)) - 1.0f) / MU;
+    }
+}
+
+//=============================================================================
+// De-emphasis Filter
+//=============================================================================
+
+static void calculate_deemphasis_coeffs(float *b0, float *b1, float *a1) {
+    // De-emphasis factor
+    const float alpha = 0.5f;
+
+    *b0 = 1.0f;
+    *b1 = 0.0f;  // No feedforward delay
+    *a1 = -alpha;  // NEGATIVE because equation has minus sign: y = x - a1*prev_y
+}
+
+static void apply_deemphasis(float *left, float *right, size_t count) {
+    // Static state variables - persistent across chunks to prevent discontinuities
+    static float prev_x_l = 0.0f;
+    static float prev_y_l = 0.0f;
+    static float prev_x_r = 0.0f;
+    static float prev_y_r = 0.0f;
+
+    float b0, b1, a1;
+    calculate_deemphasis_coeffs(&b0, &b1, &a1);
+
+    // Left channel - use persistent state
+    for (size_t i = 0; i < count; i++) {
+        float x = left[i];
+        float y = b0 * x + b1 * prev_x_l - a1 * prev_y_l;
+        left[i] = y;
+        prev_x_l = x;
+        prev_y_l = y;
+    }
+
+    // Right channel - use persistent state
+    for (size_t i = 0; i < count; i++) {
+        float x = right[i];
+        float y = b0 * x + b1 * prev_x_r - a1 * prev_y_r;
+        right[i] = y;
+        prev_x_r = x;
+        prev_y_r = y;
     }
 }
 
@@ -492,7 +588,7 @@ static void dequantize_dwt_coefficients(int channel, const int8_t *quantized, fl
         sideband_starts[i] = sideband_starts[i-1] + (first_band_size << (i-2));
     }
 
-    // Step 1: Dequantize all coefficients (no dithering yet)
+    // Dequantize all coefficients with stochastic reconstruction for deadzoned values
     for (size_t i = 0; i < count; i++) {
         int sideband = dwt_levels;
         for (int s = 0; s <= dwt_levels; s++) {
@@ -502,45 +598,279 @@ static void dequantize_dwt_coefficients(int channel, const int8_t *quantized, fl
             }
         }
 
-        // Decode using lambda companding
-        float normalized_val = lambda_decompanding(quantized[i], max_index);
+        // Check for deadzone marker
+        /*if (quantized[i] == (int8_t)0) {//DEADZONE_MARKER_QUANT) {
+            // Stochastic reconstruction: generate Laplacian noise in deadband range
+            float deadband_threshold = DEADBANDS[channel][sideband];
 
-        // Denormalize using the subband scalar and apply base weight + quantiser scaling
-        float weight = BASE_QUANTISER_WEIGHTS[channel][sideband] * quantiser_scale;
-        coeffs[i] = normalized_val * TAD32_COEFF_SCALARS[sideband] * weight;
+            // Generate Laplacian-distributed noise scaled to deadband width
+            // Use scale = threshold/3 to keep ~99% of samples within [-threshold, +threshold]
+            float noise = tpdf1() * deadband_threshold / 10.0f;
+
+            // Clamp to deadband range
+            if (noise > deadband_threshold) noise = deadband_threshold;
+            if (noise < -deadband_threshold) noise = -deadband_threshold;
+
+            // Apply scalar (but not quantiser weight - noise is already in correct range)
+            coeffs[i] = noise * TAD32_COEFF_SCALARS[sideband];
+        } else {*/
+            // Normal dequantization using lambda decompanding
+            float normalized_val = lambda_decompanding(quantized[i], max_index);
+
+            // Denormalize using the subband scalar and apply base weight + quantiser scaling
+            float weight = BASE_QUANTISER_WEIGHTS[channel][sideband] * quantiser_scale;
+            coeffs[i] = normalized_val * TAD32_COEFF_SCALARS[sideband] * weight;
+//        }
     }
 
-    // Step 2: Apply spectral interpolation per band
-    // Process bands from high to low frequency (dwt_levels down to 0)
-    // so we can use lower bands' RMS for higher band reconstruction
-    float prev_band_rms = 0.0f;
-
-    for (int band = dwt_levels; band >= 0; band--) {
-        size_t band_start = sideband_starts[band];
-        size_t band_end = sideband_starts[band + 1];
-        size_t band_len = band_end - band_start;
-
-        // Calculate quantization step Q for this band
-        float weight = BASE_QUANTISER_WEIGHTS[channel][band] * quantiser_scale;
-        float scalar = TAD32_COEFF_SCALARS[band] * weight;
-        float Q = scalar / max_index;
-
-        // Apply spectral interpolation to this band
-        spectral_interpolate_band(&coeffs[band_start], band_len, Q, prev_band_rms);
-
-        // Compute RMS for this band to use as reference for next (lower frequency) band
-        prev_band_rms = compute_band_rms(&coeffs[band_start], band_len);
-    }
+    // Note: Stochastic reconstruction replaces the old spectral interpolation step
+    // No need for additional processing - deadzoned coefficients already have appropriate noise
 
     free(sideband_starts);
+}
+
+//=============================================================================
+// Binary Tree EZBC Decoder (1D Variant for TAD)
+//=============================================================================
+
+#include <stdbool.h>
+
+// Bitstream reader for EZBC
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    size_t byte_pos;
+    uint8_t bit_pos;  // 0-7, current bit position in current byte
+} tad_bitstream_reader_t;
+
+// Block structure for 1D binary tree (same as encoder)
+typedef struct {
+    int start;
+    int length;
+} tad_decode_block_t;
+
+// Queue for block processing (same as encoder)
+typedef struct {
+    tad_decode_block_t *blocks;
+    size_t count;
+    size_t capacity;
+} tad_decode_queue_t;
+
+// Track coefficient state for refinement
+typedef struct {
+    bool significant;
+    int first_bitplane;
+} tad_decode_state_t;
+
+// Bitstream read operations
+static void tad_bitstream_reader_init(tad_bitstream_reader_t *bs, const uint8_t *data, size_t size) {
+    bs->data = data;
+    bs->size = size;
+    bs->byte_pos = 0;
+    bs->bit_pos = 0;
+}
+
+static int tad_bitstream_read_bit(tad_bitstream_reader_t *bs) {
+    if (bs->byte_pos >= bs->size) {
+        fprintf(stderr, "Error: Bitstream underflow\n");
+        return 0;
+    }
+
+    int bit = (bs->data[bs->byte_pos] >> bs->bit_pos) & 1;
+
+    bs->bit_pos++;
+    if (bs->bit_pos == 8) {
+        bs->bit_pos = 0;
+        bs->byte_pos++;
+    }
+
+    return bit;
+}
+
+static uint32_t tad_bitstream_read_bits(tad_bitstream_reader_t *bs, int num_bits) {
+    uint32_t value = 0;
+    for (int i = 0; i < num_bits; i++) {
+        value |= (tad_bitstream_read_bit(bs) << i);
+    }
+    return value;
+}
+
+// Queue operations
+static void tad_decode_queue_init(tad_decode_queue_t *q) {
+    q->capacity = 1024;
+    q->blocks = malloc(q->capacity * sizeof(tad_decode_block_t));
+    q->count = 0;
+}
+
+static void tad_decode_queue_push(tad_decode_queue_t *q, tad_decode_block_t block) {
+    if (q->count >= q->capacity) {
+        q->capacity *= 2;
+        q->blocks = realloc(q->blocks, q->capacity * sizeof(tad_decode_block_t));
+    }
+    q->blocks[q->count++] = block;
+}
+
+static void tad_decode_queue_free(tad_decode_queue_t *q) {
+    free(q->blocks);
+}
+
+// Context for recursive EZBC decoding
+typedef struct {
+    tad_bitstream_reader_t *bs;
+    int8_t *coeffs;
+    tad_decode_state_t *states;
+    int bitplane;
+    tad_decode_queue_t *next_insignificant;
+    tad_decode_queue_t *next_significant;
+} tad_decode_context_t;
+
+// Recursively decode a significant block - subdivide until size 1
+static void tad_decode_significant_block_recursive(tad_decode_context_t *ctx, tad_decode_block_t block) {
+    // If size 1: read sign bit and reconstruct value
+    if (block.length == 1) {
+        int idx = block.start;
+        int sign_bit = tad_bitstream_read_bit(ctx->bs);
+
+        // Reconstruct absolute value from bitplane
+        int abs_val = 1 << ctx->bitplane;
+
+        // Apply sign
+        ctx->coeffs[idx] = sign_bit ? -abs_val : abs_val;
+
+        ctx->states[idx].significant = true;
+        ctx->states[idx].first_bitplane = ctx->bitplane;
+        tad_decode_queue_push(ctx->next_significant, block);
+        return;
+    }
+
+    // Block is > 1: subdivide into left and right halves
+    int mid = block.length / 2;
+    if (mid == 0) mid = 1;
+
+    // Process left child
+    tad_decode_block_t left = {block.start, mid};
+    int left_sig = tad_bitstream_read_bit(ctx->bs);
+    if (left_sig) {
+        tad_decode_significant_block_recursive(ctx, left);
+    } else {
+        tad_decode_queue_push(ctx->next_insignificant, left);
+    }
+
+    // Process right child (if exists)
+    if (block.length > mid) {
+        tad_decode_block_t right = {block.start + mid, block.length - mid};
+        int right_sig = tad_bitstream_read_bit(ctx->bs);
+        if (right_sig) {
+            tad_decode_significant_block_recursive(ctx, right);
+        } else {
+            tad_decode_queue_push(ctx->next_insignificant, right);
+        }
+    }
+}
+
+// Binary tree EZBC decoding for a single channel (1D variant)
+static int tad_decode_channel_ezbc(const uint8_t *input, size_t input_size, int8_t *coeffs, size_t *bytes_consumed) {
+    tad_bitstream_reader_t bs;
+    tad_bitstream_reader_init(&bs, input, input_size);
+
+    // Read header: MSB bitplane and length
+    int msb_bitplane = tad_bitstream_read_bits(&bs, 8);
+    uint32_t count = tad_bitstream_read_bits(&bs, 16);
+
+    // Initialize coefficient array to zero
+    memset(coeffs, 0, count * sizeof(int8_t));
+
+    // Track coefficient significance
+    tad_decode_state_t *states = calloc(count, sizeof(tad_decode_state_t));
+
+    // Initialize queues
+    tad_decode_queue_t insignificant_queue, next_insignificant;
+    tad_decode_queue_t significant_queue, next_significant;
+
+    tad_decode_queue_init(&insignificant_queue);
+    tad_decode_queue_init(&next_insignificant);
+    tad_decode_queue_init(&significant_queue);
+    tad_decode_queue_init(&next_significant);
+
+    // Start with root block as insignificant
+    tad_decode_block_t root = {0, (int)count};
+    tad_decode_queue_push(&insignificant_queue, root);
+
+    // Process bitplanes from MSB to LSB
+    for (int bitplane = msb_bitplane; bitplane >= 0; bitplane--) {
+        // Process insignificant blocks
+        for (size_t i = 0; i < insignificant_queue.count; i++) {
+            tad_decode_block_t block = insignificant_queue.blocks[i];
+
+            int sig = tad_bitstream_read_bit(&bs);
+            if (sig == 0) {
+                // Still insignificant
+                tad_decode_queue_push(&next_insignificant, block);
+            } else {
+                // Became significant: recursively decode
+                tad_decode_context_t ctx = {
+                    .bs = &bs,
+                    .coeffs = coeffs,
+                    .states = states,
+                    .bitplane = bitplane,
+                    .next_insignificant = &next_insignificant,
+                    .next_significant = &next_significant
+                };
+                tad_decode_significant_block_recursive(&ctx, block);
+            }
+        }
+
+        // Refinement pass: read next bit for already-significant coefficients
+        for (size_t i = 0; i < significant_queue.count; i++) {
+            tad_decode_block_t block = significant_queue.blocks[i];
+            int idx = block.start;
+
+            int bit = tad_bitstream_read_bit(&bs);
+
+            // Add this bit to the coefficient's magnitude
+            if (bit) {
+                int sign = (coeffs[idx] < 0) ? -1 : 1;
+                int abs_val = abs(coeffs[idx]);
+                abs_val |= (1 << bitplane);
+                coeffs[idx] = sign * abs_val;
+            }
+
+            // Add to next_significant so it continues being refined
+            tad_decode_queue_push(&next_significant, block);
+        }
+
+        // Swap queues for next bitplane
+        tad_decode_queue_t temp_insig = insignificant_queue;
+        insignificant_queue = next_insignificant;
+        next_insignificant = temp_insig;
+        next_insignificant.count = 0;
+
+        tad_decode_queue_t temp_sig = significant_queue;
+        significant_queue = next_significant;
+        next_significant = temp_sig;
+        next_significant.count = 0;
+    }
+
+    // Cleanup
+    tad_decode_queue_free(&insignificant_queue);
+    tad_decode_queue_free(&next_insignificant);
+    tad_decode_queue_free(&significant_queue);
+    tad_decode_queue_free(&next_significant);
+    free(states);
+
+    // Calculate bytes consumed
+    *bytes_consumed = bs.byte_pos + (bs.bit_pos > 0 ? 1 : 0);
+
+    return 0;  // Success
 }
 
 //=============================================================================
 // Chunk Decoding
 //=============================================================================
 
-static int decode_chunk(const uint8_t *input, size_t input_size, uint8_t *pcmu8_stereo,
-                        size_t *bytes_consumed, size_t *samples_decoded) {
+// Public API: TAD32 chunk decoder (can be used by both standalone decoder and TAV decoder)
+int tad32_decode_chunk(const uint8_t *input, size_t input_size, uint8_t *pcmu8_stereo,
+                       size_t *bytes_consumed, size_t *samples_decoded) {
     const uint8_t *read_ptr = input;
 
     // Read chunk header
@@ -590,9 +920,31 @@ static int decode_chunk(const uint8_t *input, size_t input_size, uint8_t *pcmu8_
     uint8_t *pcm8_left = malloc(sample_count * sizeof(uint8_t));
     uint8_t *pcm8_right = malloc(sample_count * sizeof(uint8_t));
 
-    // Separate Mid/Side
-    memcpy(quant_mid, decompressed, sample_count);
-    memcpy(quant_side, decompressed + sample_count, sample_count);
+    // Decode Mid/Side using binary tree EZBC - FIXED!
+    size_t mid_bytes_consumed = 0;
+    size_t side_bytes_consumed = 0;
+
+    // Decode Mid channel
+    int result = tad_decode_channel_ezbc(decompressed, actual_size, quant_mid, &mid_bytes_consumed);
+    if (result != 0) {
+        fprintf(stderr, "Error: EZBC decoding failed for Mid channel\n");
+        free(decompressed);
+        free(quant_mid); free(quant_side); free(dwt_mid); free(dwt_side);
+        free(pcm32_left); free(pcm32_right); free(pcm8_left); free(pcm8_right);
+        return -1;
+    }
+
+    // Decode Side channel (starts after Mid channel data)
+    result = tad_decode_channel_ezbc(decompressed + mid_bytes_consumed,
+                                      actual_size - mid_bytes_consumed,
+                                      quant_side, &side_bytes_consumed);
+    if (result != 0) {
+        fprintf(stderr, "Error: EZBC decoding failed for Side channel\n");
+        free(decompressed);
+        free(quant_mid); free(quant_side); free(dwt_mid); free(dwt_side);
+        free(pcm32_left); free(pcm32_right); free(pcm8_left); free(pcm8_right);
+        return -1;
+    }
 
     // Dequantize with quantiser scaling and spectral interpolation
     // Use quantiser_scale = 1.0f for baseline (must match encoder)
@@ -611,6 +963,10 @@ static int decode_chunk(const uint8_t *input, size_t input_size, uint8_t *pcmu8_
 
     // expand dynamic range
     expand_gamma(pcm32_left, pcm32_right, sample_count);
+//    expand_mu_law(pcm32_left, pcm32_right, sample_count);
+
+    // Apply de-emphasis filter (AFTER gamma expansion, BEFORE PCM32f to PCM8)
+    apply_deemphasis(pcm32_left, pcm32_right, sample_count);
 
     // dither to 8-bit
     pcm32f_to_pcm8(pcm32_left, pcm32_right, pcm8_left, pcm8_right, sample_count, err);
@@ -633,6 +989,7 @@ static int decode_chunk(const uint8_t *input, size_t input_size, uint8_t *pcmu8_
 // Main Decoder
 //=============================================================================
 
+#ifndef TAD_DECODER_LIB  // Only compile main() when building standalone decoder
 static void print_usage(const char *prog_name) {
     printf("Usage: %s -i <input> [options]\n", prog_name);
     printf("Options:\n");
@@ -713,10 +1070,10 @@ int main(int argc, char *argv[]) {
             output_file[dir_len + name_len] = '\0';
 
             // Replace last dot with underscore (for .qNN pattern)
-            char *last_dot = strrchr(output_file, '.');
+            /*char *last_dot = strrchr(output_file, '.');
             if (last_dot && last_dot > output_file + dir_len) {
                 *last_dot = '_';
-            }
+            }*/
         } else {
             // No .tad extension, copy entire basename
             strcpy(output_file + dir_len, basename_start);
@@ -775,8 +1132,8 @@ int main(int argc, char *argv[]) {
 
     while (offset < input_size) {
         size_t bytes_consumed, samples_decoded;
-        int result = decode_chunk(input_data + offset, input_size - offset,
-                                  chunk_output, &bytes_consumed, &samples_decoded);
+        int result = tad32_decode_chunk(input_data + offset, input_size - offset,
+                                        chunk_output, &bytes_consumed, &samples_decoded);
 
         if (result != 0) {
             fprintf(stderr, "Error: Chunk decoding failed at offset %zu\n", offset);
@@ -828,3 +1185,4 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
+#endif  // TAD_DECODER_LIB

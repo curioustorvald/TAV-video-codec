@@ -31,7 +31,7 @@ static const float BASE_QUANTISER_WEIGHTS[2][10] = {
     1.0f,    // H (L4) 1 khz
     1.0f,    // H (L3) 2 khz
     1.3f,    // H (L2) 4 khz
-    1.8f     // H (L1) 8 khz
+    2.0f     // H (L1) 8 khz
 },
 { // side channel
     6.0f,    // LL (L9) DC
@@ -44,6 +44,33 @@ static const float BASE_QUANTISER_WEIGHTS[2][10] = {
     1.0f,    // H (L3) 2 khz
     1.6f,    // H (L2) 4 khz
     3.2f     // H (L1) 8 khz
+}};
+
+// target: before quantisation
+static const float DEADBANDS[2][10] = {
+{ // mid channel
+    0.20f,    // LL (L9) DC
+    0.06f,    // H (L9) 31.25 hz
+    0.06f,    // H (L8) 62.5 hz
+    0.06f,    // H (L7) 125 hz
+    0.06f,    // H (L6) 250 hz
+    0.04f,    // H (L5) 500 hz
+    0.04f,    // H (L4) 1 khz
+    0.01f,    // H (L3) 2 khz
+    0.01f,    // H (L2) 4 khz
+    0.01f     // H (L1) 8 khz
+},
+{ // side channel
+    0.20f,    // LL (L9) DC
+    0.06f,    // H (L9) 31.25 hz
+    0.06f,    // H (L8) 62.5 hz
+    0.06f,    // H (L7) 125 hz
+    0.06f,    // H (L6) 250 hz
+    0.04f,    // H (L5) 500 hz
+    0.04f,    // H (L4) 1 khz
+    0.01f,    // H (L3) 2 khz
+    0.01f,    // H (L2) 4 khz
+    0.01f     // H (L1) 8 khz
 }};
 
 static inline float FCLAMP(float x, float min, float max) {
@@ -73,6 +100,56 @@ static int calculate_dwt_levels(int chunk_size) {
     return levels - 2;*/  // Maximum decomposition
 
     return 9;
+}
+
+// Special marker for deadzoned coefficients (will be reconstructed with noise on decode)
+#define DEADZONE_MARKER_FLOAT (-999.0f)  // Unmistakable marker in float domain
+#define DEADZONE_MARKER_QUANT (-128)     // Maps to this in quantized domain (int8 minimum)
+
+// Perceptual epsilon - coefficients below this are truly zero (inaudible)
+#define EPSILON_PERCEPTUAL 0.001f
+
+static void apply_coeff_deadzone(int channel, float *coeffs, size_t num_samples) {
+    // Apply deadzonning to each DWT subband using frequency-dependent thresholds
+    // Instead of zeroing, mark small coefficients for stochastic reconstruction
+
+    const int dwt_levels = 9;  // Fixed to match encoder
+
+    // Calculate subband boundaries (same logic as decoder)
+    const int first_band_size = num_samples >> dwt_levels;
+    int sideband_starts[11];  // dwt_levels + 2
+    sideband_starts[0] = 0;
+    sideband_starts[1] = first_band_size;
+    for (int i = 2; i <= dwt_levels + 1; i++) {
+        sideband_starts[i] = sideband_starts[i - 1] + (first_band_size << (i - 2));
+    }
+
+    // Apply deadzone threshold to each coefficient
+    for (size_t i = 0; i < num_samples; i++) {
+        // Determine which subband this coefficient belongs to
+        int sideband = dwt_levels;  // Default to highest frequency
+        for (int s = 0; s <= dwt_levels; s++) {
+            if (i < (size_t)sideband_starts[s + 1]) {
+                sideband = s;
+                break;
+            }
+        }
+
+        // Get threshold for this subband and channel
+        float threshold = DEADBANDS[channel][sideband];
+        float abs_coeff = fabsf(coeffs[i]);
+
+        // If coefficient is within deadband AND perceptually non-zero, mark it
+        if (abs_coeff > EPSILON_PERCEPTUAL && abs_coeff < threshold) {
+            // Mark for stochastic reconstruction (decoder will add noise)
+            coeffs[i] = 0.0f;//DEADZONE_MARKER_FLOAT;
+        }
+        // If below perceptual epsilon, truly zero it
+        else if (abs_coeff <= EPSILON_PERCEPTUAL) {
+            coeffs[i] = 0.0f;
+        }
+        // Otherwise keep coefficient unchanged
+    }
 }
 
 //=============================================================================
@@ -206,6 +283,53 @@ static void dwt_forward_multilevel(float *data, int length, int levels) {
 }
 
 //=============================================================================
+// Pre-emphasis Filter
+//=============================================================================
+
+static void calculate_preemphasis_coeffs(float *b0, float *b1, float *a1) {
+    // Simple first-order digital pre-emphasis
+    // Corner frequency ≈ 1200 Hz (chosen for 32 kHz codec)
+    // Provides ~6 dB/octave boost above corner
+
+    // Pre-emphasis factor (0.95 = gentle, 0.90 = moderate, 0.85 = aggressive)
+    const float alpha = 0.5f;  // Gentle boost suitable for music
+
+    *b0 = 1.0f;
+    *b1 = -alpha;
+    *a1 = 0.0f;  // No feedback (FIR filter)
+}
+
+// emphasis at alpha=0.5 shifts quantisation crackles to lower frequency which MIGHT be more preferable
+static void apply_preemphasis(float *left, float *right, size_t count) {
+    // Static state variables - persistent across chunks to prevent discontinuities
+    static float prev_x_l = 0.0f;
+    static float prev_y_l = 0.0f;
+    static float prev_x_r = 0.0f;
+    static float prev_y_r = 0.0f;
+
+    float b0, b1, a1;
+    calculate_preemphasis_coeffs(&b0, &b1, &a1);
+
+    // Left channel - use persistent state
+    for (size_t i = 0; i < count; i++) {
+        float x = left[i];
+        float y = b0 * x + b1 * prev_x_l - a1 * prev_y_l;
+        left[i] = y;
+        prev_x_l = x;
+        prev_y_l = y;
+    }
+
+    // Right channel - use persistent state
+    for (size_t i = 0; i < count; i++) {
+        float x = right[i];
+        float y = b0 * x + b1 * prev_x_r - a1 * prev_y_r;
+        right[i] = y;
+        prev_x_r = x;
+        prev_y_r = y;
+    }
+}
+
+//=============================================================================
 // M/S Stereo Decorrelation (PCM32f version)
 //=============================================================================
 
@@ -229,9 +353,9 @@ static void compress_gamma(float *left, float *right, size_t count) {
     for (size_t i = 0; i < count; i++) {
         // encode(x) = sign(x) * |x|^γ where γ=0.5
         float x = left[i];
-        left[i] = signum(x) * powf(fabsf(x), 1.0f / 1.4142f);
+        left[i] = signum(x) * powf(fabsf(x), 0.5f);
         float y = right[i];
-        right[i] = signum(y) * powf(fabsf(y), 1.0f / 1.4142f);
+        right[i] = signum(y) * powf(fabsf(y), 0.5f);
     }
 }
 
@@ -310,12 +434,17 @@ static void quantize_dwt_coefficients(int channel, const float *coeffs, int8_t *
             current_subband_index[i] = sideband;
         }
 
-        // Apply base weight and quantiser scaling
-        float weight = BASE_QUANTISER_WEIGHTS[channel][sideband] * quantiser_scale;
-        float val = (coeffs[i] / (TAD32_COEFF_SCALARS[sideband] * weight)); // val is normalised to [-1,1]
-        int8_t quant_val = lambda_companding(val, max_index);
-
-        quantized[i] = quant_val;
+        // Check for deadzone marker (special handling)
+        /*if (coeffs[i] == DEADZONE_MARKER_FLOAT) {
+            // Map to special quantized marker for stochastic reconstruction
+            quantized[i] = (int8_t)DEADZONE_MARKER_QUANT;
+        } else {*/
+            // Normal quantization
+            float weight = BASE_QUANTISER_WEIGHTS[channel][sideband] * quantiser_scale;
+            float val = (coeffs[i] / (TAD32_COEFF_SCALARS[sideband] * weight)); // val is normalised to [-1,1]
+            int8_t quant_val = lambda_companding(val, max_index);
+            quantized[i] = quant_val;
+//        }
     }
 
     free(sideband_starts);
@@ -726,6 +855,291 @@ void tad32_free_statistics(void) {
 }
 
 //=============================================================================
+// Binary Tree EZBC (1D Variant for TAD)
+//=============================================================================
+
+#include <stdbool.h>
+
+// Bitstream writer for EZBC
+typedef struct {
+    uint8_t *data;
+    size_t capacity;
+    size_t byte_pos;
+    uint8_t bit_pos;  // 0-7, current bit position in current byte
+} tad_bitstream_t;
+
+// Block structure for 1D binary tree
+typedef struct {
+    int start;    // Start index in 1D array
+    int length;   // Block length
+} tad_block_t;
+
+// Queue for block processing
+typedef struct {
+    tad_block_t *blocks;
+    size_t count;
+    size_t capacity;
+} tad_block_queue_t;
+
+// Track coefficient state for refinement
+typedef struct {
+    bool significant;     // Has been marked significant
+    int first_bitplane;   // Bitplane where it became significant
+} tad_coeff_state_t;
+
+// Bitstream operations
+static void tad_bitstream_init(tad_bitstream_t *bs, size_t initial_capacity) {
+    bs->capacity = initial_capacity;
+    bs->data = calloc(1, initial_capacity);
+    bs->byte_pos = 0;
+    bs->bit_pos = 0;
+}
+
+static void tad_bitstream_write_bit(tad_bitstream_t *bs, int bit) {
+    // Grow if needed
+    if (bs->byte_pos >= bs->capacity) {
+        bs->capacity *= 2;
+        bs->data = realloc(bs->data, bs->capacity);
+        // Clear new memory
+        memset(bs->data + bs->byte_pos, 0, bs->capacity - bs->byte_pos);
+    }
+
+    if (bit) {
+        bs->data[bs->byte_pos] |= (1 << bs->bit_pos);
+    }
+
+    bs->bit_pos++;
+    if (bs->bit_pos == 8) {
+        bs->bit_pos = 0;
+        bs->byte_pos++;
+    }
+}
+
+static void tad_bitstream_write_bits(tad_bitstream_t *bs, uint32_t value, int num_bits) {
+    for (int i = 0; i < num_bits; i++) {
+        tad_bitstream_write_bit(bs, (value >> i) & 1);
+    }
+}
+
+static size_t tad_bitstream_size(tad_bitstream_t *bs) {
+    return bs->byte_pos + (bs->bit_pos > 0 ? 1 : 0);
+}
+
+static void tad_bitstream_free(tad_bitstream_t *bs) {
+    free(bs->data);
+}
+
+// Block queue operations
+static void tad_queue_init(tad_block_queue_t *q) {
+    q->capacity = 1024;
+    q->blocks = malloc(q->capacity * sizeof(tad_block_t));
+    q->count = 0;
+}
+
+static void tad_queue_push(tad_block_queue_t *q, tad_block_t block) {
+    if (q->count >= q->capacity) {
+        q->capacity *= 2;
+        q->blocks = realloc(q->blocks, q->capacity * sizeof(tad_block_t));
+    }
+    q->blocks[q->count++] = block;
+}
+
+static void tad_queue_free(tad_block_queue_t *q) {
+    free(q->blocks);
+}
+
+// Check if all coefficients in block have |coeff| < threshold
+static bool tad_is_zero_block(int8_t *coeffs, const tad_block_t *block, int threshold) {
+    for (int i = block->start; i < block->start + block->length; i++) {
+        if (abs(coeffs[i]) >= threshold) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Find maximum absolute coefficient value
+static int tad_find_max_abs(int8_t *coeffs, size_t count) {
+    int max_abs = 0;
+    for (size_t i = 0; i < count; i++) {
+        int abs_val = abs(coeffs[i]);
+        if (abs_val > max_abs) {
+            max_abs = abs_val;
+        }
+    }
+    return max_abs;
+}
+
+// Get MSB position (bitplane number)
+static int tad_get_msb_bitplane(int value) {
+    if (value == 0) return 0;
+    int bitplane = 0;
+    while (value > 1) {
+        value >>= 1;
+        bitplane++;
+    }
+    return bitplane;
+}
+
+// Context for recursive EZBC processing
+typedef struct {
+    tad_bitstream_t *bs;
+    int8_t *coeffs;
+    tad_coeff_state_t *states;
+    int length;
+    int bitplane;
+    int threshold;
+    tad_block_queue_t *next_insignificant;
+    tad_block_queue_t *next_significant;
+    int *sign_count;
+} tad_ezbc_context_t;
+
+// Recursively process a significant block - subdivide until size 1
+static void tad_process_significant_block_recursive(tad_ezbc_context_t *ctx, tad_block_t block) {
+    // If size 1: emit sign bit and add to significant queue
+    if (block.length == 1) {
+        int idx = block.start;
+        tad_bitstream_write_bit(ctx->bs, ctx->coeffs[idx] < 0 ? 1 : 0);
+        (*ctx->sign_count)++;
+        ctx->states[idx].significant = true;
+        ctx->states[idx].first_bitplane = ctx->bitplane;
+        tad_queue_push(ctx->next_significant, block);
+        return;
+    }
+
+    // Block is > 1: subdivide into left and right halves
+    int mid = block.length / 2;
+    if (mid == 0) mid = 1;
+
+    // Process left child
+    tad_block_t left = {block.start, mid};
+    if (!tad_is_zero_block(ctx->coeffs, &left, ctx->threshold)) {
+        tad_bitstream_write_bit(ctx->bs, 1);  // Significant
+        tad_process_significant_block_recursive(ctx, left);
+    } else {
+        tad_bitstream_write_bit(ctx->bs, 0);  // Insignificant
+        tad_queue_push(ctx->next_insignificant, left);
+    }
+
+    // Process right child (if exists)
+    if (block.length > mid) {
+        tad_block_t right = {block.start + mid, block.length - mid};
+        if (!tad_is_zero_block(ctx->coeffs, &right, ctx->threshold)) {
+            tad_bitstream_write_bit(ctx->bs, 1);
+            tad_process_significant_block_recursive(ctx, right);
+        } else {
+            tad_bitstream_write_bit(ctx->bs, 0);
+            tad_queue_push(ctx->next_insignificant, right);
+        }
+    }
+}
+
+// Binary tree EZBC encoding for a single channel (1D variant)
+// Made non-static for testing
+size_t tad_encode_channel_ezbc(int8_t *coeffs, size_t count, uint8_t **output) {
+    tad_bitstream_t bs;
+    tad_bitstream_init(&bs, count / 4);  // Initial guess
+
+    // Track coefficient significance
+    tad_coeff_state_t *states = calloc(count, sizeof(tad_coeff_state_t));
+
+    // Find maximum value to determine MSB bitplane
+    int max_abs = tad_find_max_abs(coeffs, count);
+    int msb_bitplane = tad_get_msb_bitplane(max_abs);
+
+    // Write header: MSB bitplane and length
+    tad_bitstream_write_bits(&bs, msb_bitplane, 8);
+    tad_bitstream_write_bits(&bs, (uint32_t)count, 16);
+
+    // Initialize queues
+    tad_block_queue_t insignificant_queue, next_insignificant;
+    tad_block_queue_t significant_queue, next_significant;
+
+    tad_queue_init(&insignificant_queue);
+    tad_queue_init(&next_insignificant);
+    tad_queue_init(&significant_queue);
+    tad_queue_init(&next_significant);
+
+    // Start with root block as insignificant
+    tad_block_t root = {0, (int)count};
+    tad_queue_push(&insignificant_queue, root);
+
+    // Process bitplanes from MSB to LSB
+    for (int bitplane = msb_bitplane; bitplane >= 0; bitplane--) {
+        int threshold = 1 << bitplane;
+
+        // Process insignificant blocks - check if they become significant
+        for (size_t i = 0; i < insignificant_queue.count; i++) {
+            tad_block_t block = insignificant_queue.blocks[i];
+
+            if (tad_is_zero_block(coeffs, &block, threshold)) {
+                // Still insignificant: emit 0
+                tad_bitstream_write_bit(&bs, 0);
+                // Keep in insignificant queue for next bitplane
+                tad_queue_push(&next_insignificant, block);
+            } else {
+                // Became significant: emit 1
+                tad_bitstream_write_bit(&bs, 1);
+
+                // Use recursive subdivision
+                int sign_count = 0;
+                tad_ezbc_context_t ctx = {
+                    .bs = &bs,
+                    .coeffs = coeffs,
+                    .states = states,
+                    .length = (int)count,
+                    .bitplane = bitplane,
+                    .threshold = threshold,
+                    .next_insignificant = &next_insignificant,
+                    .next_significant = &next_significant,
+                    .sign_count = &sign_count
+                };
+                tad_process_significant_block_recursive(&ctx, block);
+            }
+        }
+
+        // Refinement pass: emit next bit for already-significant coefficients
+        for (size_t i = 0; i < significant_queue.count; i++) {
+            tad_block_t block = significant_queue.blocks[i];
+            int idx = block.start;
+
+            // Emit refinement bit (bit at position 'bitplane')
+            int bit = (abs(coeffs[idx]) >> bitplane) & 1;
+            tad_bitstream_write_bit(&bs, bit);
+
+            // Add to next_significant so it continues being refined
+            tad_queue_push(&next_significant, block);
+        }
+
+        // Swap queues for next bitplane
+        tad_block_queue_t temp_insig = insignificant_queue;
+        insignificant_queue = next_insignificant;
+        next_insignificant = temp_insig;
+        next_insignificant.count = 0;  // Clear for reuse
+
+        tad_block_queue_t temp_sig = significant_queue;
+        significant_queue = next_significant;
+        next_significant = temp_sig;
+        next_significant.count = 0;  // Clear for reuse
+    }
+
+    // Cleanup queues
+    tad_queue_free(&insignificant_queue);
+    tad_queue_free(&next_insignificant);
+    tad_queue_free(&significant_queue);
+    tad_queue_free(&next_significant);
+    free(states);
+
+    // Copy bitstream to output
+    size_t output_size = tad_bitstream_size(&bs);
+    *output = malloc(output_size);
+    memcpy(*output, bs.data, output_size);
+    tad_bitstream_free(&bs);
+
+    return output_size;
+}
+
+//=============================================================================
 // Public API: Chunk Encoding
 //=============================================================================
 
@@ -757,8 +1171,12 @@ size_t tad32_encode_chunk(const float *pcm32_stereo, size_t num_samples,
         pcm32_right[i] = pcm32_stereo[i * 2 + 1];
     }
 
-    // Step 1.1: Compress dynamic range
+    // Step 1.1: Apply pre-emphasis filter (BEFORE gamma compression)
+    apply_preemphasis(pcm32_left, pcm32_right, num_samples);
+
+    // Step 1.2: Compress dynamic range
     compress_gamma(pcm32_left, pcm32_right, num_samples);
+//    compress_mu_law(pcm32_left, pcm32_right, num_samples);
 
     // Step 2: M/S decorrelation
     ms_decorrelate(pcm32_left, pcm32_right, pcm32_mid, pcm32_side, num_samples);
@@ -785,6 +1203,9 @@ size_t tad32_encode_chunk(const float *pcm32_stereo, size_t num_samples,
         accumulate_coefficients(dwt_side, dwt_levels, num_samples, side_accumulators);
     }
 
+//    apply_coeff_deadzone(0, dwt_mid, num_samples);
+//    apply_coeff_deadzone(1, dwt_side, num_samples);
+
     // Step 4: Quantize with frequency-dependent weights and quantiser scaling
     quantize_dwt_coefficients(0, dwt_mid, quant_mid, num_samples, 1, num_samples, dwt_levels, max_index, NULL, quantiser_scale);
     quantize_dwt_coefficients(1, dwt_side, quant_side, num_samples, 1, num_samples, dwt_levels, max_index, NULL, quantiser_scale);
@@ -795,17 +1216,21 @@ size_t tad32_encode_chunk(const float *pcm32_stereo, size_t num_samples,
         accumulate_quantized(quant_side, dwt_levels, num_samples, side_quant_accumulators);
     }
 
-    // Step 5: Encode with twobit-map significance map or raw int8_t storage
-    uint8_t *temp_buffer = malloc(num_samples * 4);  // Generous buffer
-    size_t mid_size, side_size;
+    // Step 5: Encode with binary tree EZBC (1D variant) - FIXED!
+    uint8_t *mid_ezbc = NULL;
+    uint8_t *side_ezbc = NULL;
 
-    // Raw int8_t storage
-    memcpy(temp_buffer, quant_mid, num_samples);
-    mid_size = num_samples;
-    memcpy(temp_buffer + mid_size, quant_side, num_samples);
-    side_size = num_samples;
+    size_t mid_size = tad_encode_channel_ezbc(quant_mid, num_samples, &mid_ezbc);
+    size_t side_size = tad_encode_channel_ezbc(quant_side, num_samples, &side_ezbc);
 
+    // Concatenate EZBC outputs
     size_t uncompressed_size = mid_size + side_size;
+    uint8_t *temp_buffer = malloc(uncompressed_size);
+    memcpy(temp_buffer, mid_ezbc, mid_size);
+    memcpy(temp_buffer + mid_size, side_ezbc, side_size);
+
+    free(mid_ezbc);
+    free(side_ezbc);
 
     // Step 6: Optional Zstd compression
     uint8_t *write_ptr = output;

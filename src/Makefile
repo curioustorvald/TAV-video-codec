@@ -16,13 +16,13 @@ OPENCV_CFLAGS = $(shell pkg-config --cflags opencv4)
 OPENCV_LIBS = $(shell pkg-config --libs opencv4)
 
 # Source files and targets
-TARGETS = tav tav_inspector
+TARGETS = tav tav_decoder tav_inspector
+TAD_TARGETS = encoder_tad decoder_tad
 
 # Build all encoders
 all: $(TARGETS)
 
 # Build main encoder
-
 tav: encoder_tav.c encoder_tad.c encoder_tav_opencv.cpp
 	rm -f encoder_tav encoder_tav.o encoder_tad.o encoder_tav_opencv.o
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -c encoder_tav.c -o encoder_tav.o
@@ -30,10 +30,29 @@ tav: encoder_tav.c encoder_tad.c encoder_tav_opencv.cpp
 	$(CXX) $(CXXFLAGS) $(OPENCV_CFLAGS) $(ZSTD_CFLAGS) -c encoder_tav_opencv.cpp -o encoder_tav_opencv.o
 	$(CXX) -o encoder_tav encoder_tav.o encoder_tad.o encoder_tav_opencv.o $(LIBS) $(OPENCV_LIBS)
 
+tav_decoder: decoder_tav.c decoder_tad.c decoder_tad.h
+	rm -f decoder_tav decoder_tav.o
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -DTAD_DECODER_LIB -c decoder_tad.c -o decoder_tad.o
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -c decoder_tav.c -o decoder_tav.o
+	$(CC) -o decoder_tav decoder_tav.o decoder_tad.o $(LIBS)
+
 tav_inspector: tav_inspector.c
 	rm -f tav_inspector
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o tav_inspector $< $(LIBS)
 
+# Build TAD (Terrarum Advanced Audio) tools
+encoder_tad: encoder_tad_standalone.c encoder_tad.c encoder_tad.h
+	rm -f encoder_tad encoder_tad_standalone.o encoder_tad.o
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -c encoder_tad.c -o encoder_tad.o
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -c encoder_tad_standalone.c -o encoder_tad_standalone.o
+	$(CC) -o encoder_tad encoder_tad_standalone.o encoder_tad.o $(LIBS)
+
+decoder_tad: decoder_tad.c
+	rm -f decoder_tad
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o decoder_tad $< $(LIBS)
+
+# Build all TAD tools
+tad: $(TAD_TARGETS)
 
 # Build with debug symbols
 debug: CFLAGS += -g -DDEBUG
@@ -41,12 +60,15 @@ debug: $(TARGETS)
 
 # Clean build artifacts
 clean:
-	rm -f $(TARGETS) *.o
+	rm -f $(TARGETS) $(TAD_TARGETS) *.o
 
 # Install (copy to PATH)
 install: $(TARGETS) $(TAD_TARGETS)
+	cp encoder_tev /usr/local/bin/
 	cp encoder_tav /usr/local/bin/
 	cp decoder_tav /usr/local/bin/
+	cp encoder_tad /usr/local/bin/
+	cp decoder_tad /usr/local/bin/
 
 # Check for required dependencies
 check-deps:
@@ -57,11 +79,14 @@ check-deps:
 
 # Help
 help:
-	@echo "TSVM Advanced Video (TAV) Encoders"
+	@echo "TSVM Advanced Video (TAV) and Audio (TAD) Encoders"
 	@echo ""
 	@echo "Targets:"
 	@echo "  all          - Build video encoders (default)"
 	@echo "  tav          - Build the TAV advanced video encoder"
+	@echo "  tad          - Build all TAD audio tools (encoder, decoder)"
+	@echo "  encoder_tad  - Build TAD audio encoder"
+	@echo "  decoder_tad  - Build TAD audio decoder"
 	@echo "  debug        - Build with debug symbols"
 	@echo "  clean        - Remove build artifacts"
 	@echo "  install      - Install to /usr/local/bin"
@@ -71,6 +96,7 @@ help:
 	@echo "Usage:"
 	@echo "  make               # Build video encoders"
 	@echo "  make tav           # Build TAV encoder"
+	@echo "  make tad           # Build all TAD audio tools"
 	@echo "  sudo make install  # Install all encoders"
 
-.PHONY: all clean install check-deps help debug
+.PHONY: all clean install check-deps help debug tad

@@ -11,7 +11,7 @@
 // Constants (must match encoder)
 #define TAD32_SAMPLE_RATE 32000
 #define TAD32_CHANNELS 2  // Stereo
-#define TAD_DEFAULT_CHUNK_SIZE 31991  // Default chunk size for standalone TAD files
+#define TAD_DEFAULT_CHUNK_SIZE 32768  // Default chunk size for standalone TAD files
 
 /**
  * Decode audio chunk with TAD32 codec

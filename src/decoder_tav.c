@@ -32,7 +32,9 @@
 #define TAV_PACKET_AUDIO_TAD       0x24  // TAD audio - SUPPORTED (decode to PCMu8)
 #define TAV_PACKET_AUDIO_TRACK     0x40  // Bundled audio track - SUPPORTED (passthrough)
 #define TAV_PACKET_SUBTITLE        0x30  // Subtitle - SKIPPED
+#define TAV_PACKET_SUBTITLE_TC     0x31  // Subtitle - SKIPPED
 #define TAV_PACKET_EXTENDED_HDR    0xEF  // Extended header - SKIPPED
+#define TAV_PACKET_SCREEN_MASK     0xF2  // Screen masking (letterbox/pillarbox) - PARSED
 #define TAV_PACKET_GOP_SYNC        0xFC  // GOP sync packet - SKIPPED
 #define TAV_PACKET_TIMECODE        0xFD  // Timecode - SKIPPED
 #define TAV_PACKET_SYNC_NTSC       0xFE  // NTSC sync - SKIPPED
@@ -687,11 +689,18 @@ static void decode_channel_ezbc(const uint8_t *ezbc_data, size_t offset, size_t 
 //    fprintf(stderr, "[EZBC] Decoded header: MSB=%d, width=%d, height=%d (expected pixels=%d)\n",
 //           msb_bitplane, width, height, expected_count);
 
-    if (width * height != expected_count) {
-        fprintf(stderr, "EZBC dimension mismatch: %dx%d != %d\n", width, height, expected_count);
+    // With crop encoding, dimensions can vary per frame - trust the EZBC header
+    // Just ensure we don't overflow the output buffer
+    const int actual_count = width * height;
+    if (actual_count > expected_count) {
+        fprintf(stderr, "EZBC dimension overflow: %dx%d (%d) > %d\n",
+                width, height, actual_count, expected_count);
         memset(output, 0, expected_count * sizeof(int16_t));
         return;
     }
+
+    // If actual count is less, only decode what we need
+    expected_count = actual_count;
 
     // Initialise output and state tracking
     memset(output, 0, expected_count * sizeof(int16_t));
@@ -781,6 +790,47 @@ static void decode_channel_ezbc(const uint8_t *ezbc_data, size_t offset, size_t 
     }
 //    fprintf(stderr, "[EZBC] Decoded %d non-zero coeffs (%.1f%%), range: [%d, %d]\n",
 //           nonzero_count, 100.0 * nonzero_count / expected_count, min_val, max_val);
+}
+
+// Helper: peek at EZBC header to get dimensions without decoding
+static int ezbc_peek_dimensions(const uint8_t *compressed_data, int channel_layout,
+                                 int *out_width, int *out_height) {
+    const int has_y = (channel_layout & 0x04) == 0;
+
+    if (!has_y) {
+        return -1;  // Need Y channel to get dimensions
+    }
+
+    // Read Y channel size header
+    const uint32_t size = ((uint32_t)compressed_data[0]) |
+                         ((uint32_t)compressed_data[1] << 8) |
+                         ((uint32_t)compressed_data[2] << 16) |
+                         ((uint32_t)compressed_data[3] << 24);
+
+    if (size < 6) {
+        return -1;  // Too small to contain EZBC header
+    }
+
+    // Skip to EZBC data for Y channel (after size header)
+    const uint8_t *ezbc_data = compressed_data + 4;
+
+    // Read EZBC header: skip MSB bitplane (1 byte), then read width and height
+    // Note: EZBC uses bitstream format, but dimensions are at fixed positions
+    // We need to parse the bitstream header carefully
+
+    // Create a temporary reader to parse the bitstream
+    ezbc_bitreader_t reader;
+    reader.data = ezbc_data;
+    reader.size = size;
+    reader.byte_pos = 0;
+    reader.bit_pos = 0;
+
+    // Read header: MSB bitplane (8 bits), width (16 bits), height (16 bits)
+    ezbc_read_bits(&reader, 8);  // Skip MSB bitplane
+    *out_width = ezbc_read_bits(&reader, 16);
+    *out_height = ezbc_read_bits(&reader, 16);
+
+    return 0;
 }
 
 // EZBC postprocessing for single frames
@@ -943,11 +993,34 @@ static void dwt_97_inverse_1d(float *data, int length) {
     free(temp);
 }
 
-// 5/3 inverse DWT (simplified - uses 9/7 for now)
+// 5/3 inverse DWT using lifting scheme (JPEG 2000 reversible filter)
 static void dwt_53_inverse_1d(float *data, int length) {
     if (length < 2) return;
-    // TODO: Implement proper 5/3 from TSVM if needed
-    dwt_97_inverse_1d(data, length);
+
+    float *temp = malloc(length * sizeof(float));
+    int half = (length + 1) / 2;
+
+    // Copy low-pass and high-pass subbands to temp
+    memcpy(temp, data, length * sizeof(float));
+
+    // Undo update step (low-pass)
+    for (int i = 0; i < half; i++) {
+        float update = 0.25f * ((i > 0 ? temp[half + i - 1] : 0) +
+                               (i < half - 1 ? temp[half + i] : 0));
+        temp[i] -= update;
+    }
+
+    // Undo predict step (high-pass) and interleave samples
+    for (int i = 0; i < half; i++) {
+        data[2 * i] = temp[i];  // Even samples (low-pass)
+        int idx = 2 * i + 1;
+        if (idx < length) {
+            float pred = 0.5f * (temp[i] + (i < half - 1 ? temp[i + 1] : temp[i]));
+            data[idx] = temp[half + i] + pred;  // Odd samples (high-pass)
+        }
+    }
+
+    free(temp);
 }
 
 // Multi-level inverse DWT (matches TSVM exactly with correct non-power-of-2 handling)
@@ -1130,7 +1203,8 @@ static void dwt_haar_inverse_1d(float *data, int length) {
 // Order: SPATIAL first (each frame), then TEMPORAL (across frames)
 static void apply_inverse_3d_dwt(float **gop_y, float **gop_co, float **gop_cg,
                                 int width, int height, int gop_size,
-                                int spatial_levels, int temporal_levels, int filter_type) {
+                                int spatial_levels, int temporal_levels, int filter_type,
+                                int temporal_motion_coder) {
     // Step 1: Apply inverse 2D spatial DWT to each frame
     for (int t = 0; t < gop_size; t++) {
         apply_inverse_dwt_multilevel(gop_y[t], width, height, spatial_levels, filter_type);
@@ -1162,7 +1236,12 @@ static void apply_inverse_3d_dwt(float **gop_y, float **gop_co, float **gop_cg,
             for (int level = temporal_levels - 1; level >= 0; level--) {
                 const int level_frames = temporal_lengths[level];
                 if (level_frames >= 2) {
-                    dwt_haar_inverse_1d(temporal_line, level_frames);
+                    // Use selected temporal wavelet (0=Haar, 1=CDF 5/3)
+                    if (temporal_motion_coder == 0) {
+                        dwt_haar_inverse_1d(temporal_line, level_frames);
+                    } else {
+                        dwt_53_inverse_1d(temporal_line, level_frames);
+                    }
                 }
             }
             for (int t = 0; t < gop_size; t++) {
@@ -1176,7 +1255,12 @@ static void apply_inverse_3d_dwt(float **gop_y, float **gop_co, float **gop_cg,
             for (int level = temporal_levels - 1; level >= 0; level--) {
                 const int level_frames = temporal_lengths[level];
                 if (level_frames >= 2) {
-                    dwt_haar_inverse_1d(temporal_line, level_frames);
+                    // Use selected temporal wavelet (0=Haar, 1=CDF 5/3)
+                    if (temporal_motion_coder == 0) {
+                        dwt_haar_inverse_1d(temporal_line, level_frames);
+                    } else {
+                        dwt_53_inverse_1d(temporal_line, level_frames);
+                    }
                 }
             }
             for (int t = 0; t < gop_size; t++) {
@@ -1190,7 +1274,12 @@ static void apply_inverse_3d_dwt(float **gop_y, float **gop_co, float **gop_cg,
             for (int level = temporal_levels - 1; level >= 0; level--) {
                 const int level_frames = temporal_lengths[level];
                 if (level_frames >= 2) {
-                    dwt_haar_inverse_1d(temporal_line, level_frames);
+                    // Use selected temporal wavelet (0=Haar, 1=CDF 5/3)
+                    if (temporal_motion_coder == 0) {
+                        dwt_haar_inverse_1d(temporal_line, level_frames);
+                    } else {
+                        dwt_53_inverse_1d(temporal_line, level_frames);
+                    }
                 }
             }
             for (int t = 0; t < gop_size; t++) {
@@ -1455,15 +1544,61 @@ error_cleanup:
 // Postprocess GOP EZBC format to per-frame coefficients (entropyCoder=1)
 // Layout: [frame0_size(4)][frame0_ezbc_data][frame1_size(4)][frame1_ezbc_data]...
 // Note: EZBC is a complex embedded bitplane codec - this is a simplified placeholder
+// Returns the actual dimensions through output parameters (for crop encoding support)
 static int16_t ***postprocess_gop_ezbc(const uint8_t *decompressed_data, size_t data_size,
-                                      int gop_size, int num_pixels, int channel_layout) {
-    // Allocate output arrays: [gop_size][3 channels][num_pixels]
+                                      int gop_size, int num_pixels, int channel_layout,
+                                      int *out_width, int *out_height) {
+    // First, peek at the first frame's dimensions to determine actual GOP size
+    // (with crop encoding, GOP dimensions may be smaller than full frame)
+    int actual_width = 0, actual_height = 0;
+    int actual_pixels = num_pixels;  // Default to full frame if peek fails
+
+    if (data_size >= 8) {  // Need at least frame size header + some EZBC data
+        // Skip first frame's size header to get to EZBC data
+        const uint32_t first_frame_size = ((uint32_t)decompressed_data[0]) |
+                                         ((uint32_t)decompressed_data[1] << 8) |
+                                         ((uint32_t)decompressed_data[2] << 16) |
+                                         ((uint32_t)decompressed_data[3] << 24);
+
+        if (4 + first_frame_size <= data_size) {
+            if (ezbc_peek_dimensions(decompressed_data + 4, channel_layout,
+                                     &actual_width, &actual_height) == 0) {
+                actual_pixels = actual_width * actual_height;
+                // Only log if dimensions differ significantly (crop encoding active)
+                // Suppress repetitive messages by using static counter
+                static int crop_log_count = 0;
+                if (actual_pixels != num_pixels && crop_log_count < 3) {
+                    fprintf(stderr, "[GOP-EZBC] Detected crop encoding: GOP dimensions %dx%d (%d pixels) vs full frame %d pixels\n",
+                           actual_width, actual_height, actual_pixels, num_pixels);
+                    crop_log_count++;
+                    if (crop_log_count == 3) {
+                        fprintf(stderr, "[GOP-EZBC] (Further crop encoding messages suppressed)\n");
+                    }
+                }
+            }
+        }
+    }
+
+    // If we didn't successfully peek dimensions, calculate from num_pixels
+    if (actual_width == 0 || actual_height == 0) {
+        // Assume square-ish dimensions - this is a fallback, should not happen with proper encoding
+        actual_width = (int)sqrt(num_pixels);
+        actual_height = num_pixels / actual_width;
+        actual_pixels = actual_width * actual_height;
+    }
+
+    // Return actual dimensions to caller
+    if (out_width) *out_width = actual_width;
+    if (out_height) *out_height = actual_height;
+
+    // Allocate output arrays: [gop_size][3 channels][actual_pixels]
+    // Use actual GOP dimensions (may be cropped) not full frame size
     int16_t ***output = malloc(gop_size * sizeof(int16_t **));
     for (int t = 0; t < gop_size; t++) {
         output[t] = malloc(3 * sizeof(int16_t *));
-        output[t][0] = calloc(num_pixels, sizeof(int16_t));  // Y
-        output[t][1] = calloc(num_pixels, sizeof(int16_t));  // Co
-        output[t][2] = calloc(num_pixels, sizeof(int16_t));  // Cg
+        output[t][0] = calloc(actual_pixels, sizeof(int16_t));  // Y
+        output[t][1] = calloc(actual_pixels, sizeof(int16_t));  // Co
+        output[t][2] = calloc(actual_pixels, sizeof(int16_t));  // Cg
     }
 
     int offset = 0;
@@ -1489,8 +1624,9 @@ static int16_t ***postprocess_gop_ezbc(const uint8_t *decompressed_data, size_t 
         }
 
         // Decode EZBC frame using the single-frame EZBC decoder
+        // Pass actual_pixels (cropped size) not num_pixels (full frame size)
         postprocess_coefficients_ezbc(
-            (uint8_t *)(decompressed_data + offset), num_pixels,
+            (uint8_t *)(decompressed_data + offset), actual_pixels,
             output[t][0], output[t][1], output[t][2],
             channel_layout);
 
@@ -1586,6 +1722,15 @@ static void write_wav_header(FILE *fp, uint32_t sample_rate, uint16_t channels, 
 // Decoder State Structure
 //=============================================================================
 
+// Screen masking entry (letterbox/pillarbox geometry change)
+typedef struct {
+    uint32_t frame_num;
+    uint16_t top;
+    uint16_t right;
+    uint16_t bottom;
+    uint16_t left;
+} screen_mask_entry_t;
+
 typedef struct {
     FILE *input_fp;
     tav_header_t header;
@@ -1600,6 +1745,23 @@ typedef struct {
     int frame_count;
     int frame_size;
     int is_monoblock;           // True if version 3-6 (single tile mode)
+    int temporal_motion_coder;  // Temporal wavelet: 0=Haar, 1=CDF 5/3 (extracted from version)
+
+    // Screen masking (letterbox/pillarbox) - array of geometry changes
+    screen_mask_entry_t *screen_masks;
+    int screen_mask_count;
+    int screen_mask_capacity;
+    // Current active mask
+    uint16_t screen_mask_top;
+    uint16_t screen_mask_right;
+    uint16_t screen_mask_bottom;
+    uint16_t screen_mask_left;
+
+    // Phase 2: Decoding dimensions (may differ from full frame dimensions per GOP)
+    int decoding_width;     // Actual encoded dimensions (cropped active region)
+    int decoding_height;    // Updated when Screen Mask packet is encountered
+    // Note: Buffers are allocated at max size (header.width × header.height)
+    //       but only decoding_width × decoding_height portion is used
 
     // FFmpeg pipe for video only (audio from file)
     FILE *video_pipe;
@@ -1666,6 +1828,11 @@ static int extract_audio_to_wav(const char *input_file, const char *wav_file, in
 
         if (packet_type == TAV_PACKET_GOP_SYNC) {
             fseek(input_fp, 1, SEEK_CUR);  // Skip frame count
+            continue;
+        }
+
+        if (packet_type == TAV_PACKET_SCREEN_MASK) {
+            fseek(input_fp, 12, SEEK_CUR);  // Skip frame_num(4) + top(2) + right(2) + bottom(2) + left(2)
             continue;
         }
 
@@ -1815,8 +1982,16 @@ static tav_decoder_t* tav_decoder_init(const char *input_file, const char *outpu
     }
 
     decoder->frame_size = decoder->header.width * decoder->header.height;
-    decoder->is_monoblock = (decoder->header.version >= 3 && decoder->header.version <= 6);
+    // Extract temporal motion coder from version (versions 9-16 use CDF 5/3, 1-8 use Haar)
+    decoder->temporal_motion_coder = (decoder->header.version > 8) ? 1 : 0;
+    // Extract base version for determining monoblock mode
+    uint8_t base_version = (decoder->header.version > 8) ? (decoder->header.version - 8) : decoder->header.version;
+    decoder->is_monoblock = (base_version >= 3 && base_version <= 6);
     decoder->audio_file_path = strdup(audio_file);
+
+    // Phase 2: Initialize decoding dimensions to full frame (will be updated by Screen Mask packets)
+    decoder->decoding_width = decoder->header.width;
+    decoder->decoding_height = decoder->header.height;
 
     // Allocate buffers
     decoder->current_frame_rgb = calloc(decoder->frame_size * 3, 1);
@@ -1948,8 +2123,112 @@ static void tav_decoder_free(tav_decoder_t *decoder) {
     free(decoder->reference_ycocg_y);
     free(decoder->reference_ycocg_co);
     free(decoder->reference_ycocg_cg);
+    free(decoder->screen_masks);
     free(decoder->audio_file_path);
     free(decoder);
+}
+
+//=============================================================================
+// Screen Mask Management
+//=============================================================================
+
+// Fill masked regions (letterbox/pillarbox bars) with black
+// Phase 2: Composite cropped frame back to full frame with black borders
+static uint8_t* composite_to_full_frame(const uint8_t *cropped_rgb,
+                                        int cropped_width, int cropped_height,
+                                        int full_width, int full_height,
+                                        uint16_t top, uint16_t right,
+                                        uint16_t bottom, uint16_t left) {
+    // Allocate full frame buffer (filled with black)
+    uint8_t *full_frame = calloc(full_width * full_height * 3, sizeof(uint8_t));
+    if (!full_frame) {
+        return NULL;
+    }
+
+    // Calculate active region position in full frame
+    const int dest_x = left;
+    const int dest_y = top;
+
+    // Copy cropped frame into active region
+    for (int y = 0; y < cropped_height; y++) {
+        for (int x = 0; x < cropped_width; x++) {
+            const int src_offset = (y * cropped_width + x) * 3;
+            const int dest_offset = ((dest_y + y) * full_width + (dest_x + x)) * 3;
+
+            full_frame[dest_offset + 0] = cropped_rgb[src_offset + 0];  // R
+            full_frame[dest_offset + 1] = cropped_rgb[src_offset + 1];  // G
+            full_frame[dest_offset + 2] = cropped_rgb[src_offset + 2];  // B
+        }
+    }
+
+    return full_frame;
+}
+
+static void fill_masked_regions(uint8_t *frame_rgb, int width, int height,
+                                uint16_t top, uint16_t right, uint16_t bottom, uint16_t left) {
+    // Fill top letterbox bar
+    for (int y = 0; y < top && y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int offset = (y * width + x) * 3;
+            frame_rgb[offset] = 255;     // R
+            frame_rgb[offset + 1] = 0; // G
+            frame_rgb[offset + 2] = 0; // B
+        }
+    }
+
+    // Fill bottom letterbox bar
+    for (int y = height - bottom; y < height; y++) {
+        if (y < 0) continue;
+        for (int x = 0; x < width; x++) {
+            int offset = (y * width + x) * 3;
+            frame_rgb[offset] = 255;     // R
+            frame_rgb[offset + 1] = 0; // G
+            frame_rgb[offset + 2] = 0; // B
+        }
+    }
+
+    // Fill left pillarbox bar
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < left && x < width; x++) {
+            int offset = (y * width + x) * 3;
+            frame_rgb[offset] = 0;     // R
+            frame_rgb[offset + 1] = 0; // G
+            frame_rgb[offset + 2] = 255; // B
+        }
+    }
+
+    // Fill right pillarbox bar
+    for (int y = 0; y < height; y++) {
+        for (int x = width - right; x < width; x++) {
+            if (x < 0) continue;
+            int offset = (y * width + x) * 3;
+            frame_rgb[offset] = 0;     // R
+            frame_rgb[offset + 1] = 0; // G
+            frame_rgb[offset + 2] = 255; // B
+        }
+    }
+}
+
+// Update active screen mask for the given frame number
+// Screen mask packets are sorted by frame_num, so we find the last entry
+// with frame_num <= current_frame_num
+static void update_screen_mask(tav_decoder_t *decoder, uint32_t current_frame_num) {
+    if (!decoder->screen_masks || decoder->screen_mask_count == 0) {
+        return;  // No screen mask entries
+    }
+
+    // Find the most recent screen mask entry for this frame
+    // Entries are in order, so scan backwards for efficiency
+    for (int i = decoder->screen_mask_count - 1; i >= 0; i--) {
+        if (decoder->screen_masks[i].frame_num <= current_frame_num) {
+            // Apply this mask
+            decoder->screen_mask_top = decoder->screen_masks[i].top;
+            decoder->screen_mask_right = decoder->screen_masks[i].right;
+            decoder->screen_mask_bottom = decoder->screen_masks[i].bottom;
+            decoder->screen_mask_left = decoder->screen_masks[i].left;
+            return;
+        }
+    }
 }
 
 //=============================================================================
@@ -2046,7 +2325,9 @@ static int decode_i_or_p_frame(tav_decoder_t *decoder, uint8_t packet_type, uint
         memcpy(decoder->current_frame_rgb, decoder->reference_frame_rgb, decoder->frame_size * 3);
     } else {
         // Decode coefficients (use function-level variables for proper cleanup)
-        int coeff_count = decoder->frame_size;
+        // Phase 2: Use decoding dimensions (actual encoded size)
+        const int decoding_pixels = decoder->decoding_width * decoder->decoding_height;
+        int coeff_count = decoding_pixels;
         quantised_y = calloc(coeff_count, sizeof(int16_t));
         quantised_co = calloc(coeff_count, sizeof(int16_t));
         quantised_cg = calloc(coeff_count, sizeof(int16_t));
@@ -2084,45 +2365,54 @@ static int decode_i_or_p_frame(tav_decoder_t *decoder, uint8_t packet_type, uint
 //            fprintf(stderr, "  Max quantised Y coefficient: %d\n", max_quant_y);
 //        }
 
+        // Phase 2: Allocate temporary DWT buffers for cropped region processing
+        float *temp_dwt_y = calloc(decoding_pixels, sizeof(float));
+        float *temp_dwt_co = calloc(decoding_pixels, sizeof(float));
+        float *temp_dwt_cg = calloc(decoding_pixels, sizeof(float));
+
+        if (!temp_dwt_y || !temp_dwt_co || !temp_dwt_cg) {
+            fprintf(stderr, "Error: Failed to allocate temporary DWT buffers\n");
+            free(temp_dwt_y);
+            free(temp_dwt_co);
+            free(temp_dwt_cg);
+            decode_success = 0;
+            goto write_frame;
+        }
+
         // Dequantise (perceptual for versions 5-8, uniform for 1-4)
-        const int is_perceptual = (decoder->header.version >= 5 && decoder->header.version <= 8);
+        // Phase 2: Use decoding dimensions and temporary buffers
+        // Extract base version for perceptual check
+        uint8_t base_version = (decoder->header.version > 8) ? (decoder->header.version - 8) : decoder->header.version;
+        const int is_perceptual = (base_version >= 5 && base_version <= 8);
         const int is_ezbc = (decoder->header.entropy_coder == 1);
 
         if (is_ezbc && is_perceptual) {
             // EZBC mode with perceptual quantisation: coefficients are normalised
             // Need to dequantise using perceptual weights (same as twobit-map mode)
-            dequantise_dwt_subbands_perceptual(0, qy, quantised_y, decoder->dwt_buffer_y,
-                                              decoder->header.width, decoder->header.height,
+            dequantise_dwt_subbands_perceptual(0, qy, quantised_y, temp_dwt_y,
+                                              decoder->decoding_width, decoder->decoding_height,
                                               decoder->header.decomp_levels, qy, 0, decoder->frame_count);
-            dequantise_dwt_subbands_perceptual(0, qy, quantised_co, decoder->dwt_buffer_co,
-                                              decoder->header.width, decoder->header.height,
+            dequantise_dwt_subbands_perceptual(0, qy, quantised_co, temp_dwt_co,
+                                              decoder->decoding_width, decoder->decoding_height,
                                               decoder->header.decomp_levels, qco, 1, decoder->frame_count);
-            dequantise_dwt_subbands_perceptual(0, qy, quantised_cg, decoder->dwt_buffer_cg,
-                                              decoder->header.width, decoder->header.height,
+            dequantise_dwt_subbands_perceptual(0, qy, quantised_cg, temp_dwt_cg,
+                                              decoder->decoding_width, decoder->decoding_height,
                                               decoder->header.decomp_levels, qcg, 1, decoder->frame_count);
         } else if (is_perceptual) {
-            dequantise_dwt_subbands_perceptual(0, qy, quantised_y, decoder->dwt_buffer_y,
-                                              decoder->header.width, decoder->header.height,
+            dequantise_dwt_subbands_perceptual(0, qy, quantised_y, temp_dwt_y,
+                                              decoder->decoding_width, decoder->decoding_height,
                                               decoder->header.decomp_levels, qy, 0, decoder->frame_count);
-
-            // Debug: Check if values survived the function call
-//            if (decoder->frame_count == 32) {
-//                fprintf(stderr, "  RIGHT AFTER dequantise_Y returns: first 5 values: %.1f %.1f %.1f %.1f %.1f\n",
-//                       decoder->dwt_buffer_y[0], decoder->dwt_buffer_y[1], decoder->dwt_buffer_y[2],
-//                       decoder->dwt_buffer_y[3], decoder->dwt_buffer_y[4]);
-//            }
-
-            dequantise_dwt_subbands_perceptual(0, qy, quantised_co, decoder->dwt_buffer_co,
-                                              decoder->header.width, decoder->header.height,
+            dequantise_dwt_subbands_perceptual(0, qy, quantised_co, temp_dwt_co,
+                                              decoder->decoding_width, decoder->decoding_height,
                                               decoder->header.decomp_levels, qco, 1, decoder->frame_count);
-            dequantise_dwt_subbands_perceptual(0, qy, quantised_cg, decoder->dwt_buffer_cg,
-                                              decoder->header.width, decoder->header.height,
+            dequantise_dwt_subbands_perceptual(0, qy, quantised_cg, temp_dwt_cg,
+                                              decoder->decoding_width, decoder->decoding_height,
                                               decoder->header.decomp_levels, qcg, 1, decoder->frame_count);
         } else {
             for (int i = 0; i < coeff_count; i++) {
-                decoder->dwt_buffer_y[i] = quantised_y[i] * qy;
-                decoder->dwt_buffer_co[i] = quantised_co[i] * qco;
-                decoder->dwt_buffer_cg[i] = quantised_cg[i] * qcg;
+                temp_dwt_y[i] = quantised_y[i] * qy;
+                temp_dwt_co[i] = quantised_co[i] * qco;
+                temp_dwt_cg[i] = quantised_cg[i] * qcg;
             }
         }
 
@@ -2154,7 +2444,8 @@ static int decode_i_or_p_frame(tav_decoder_t *decoder, uint8_t packet_type, uint
 //        }
 
         // Remove grain synthesis from Y channel (must happen after dequantisation, before inverse DWT)
-        remove_grain_synthesis_decoder(decoder->dwt_buffer_y, decoder->header.width, decoder->header.height,
+        // Phase 2: Use decoding dimensions and temporary buffer
+        remove_grain_synthesis_decoder(temp_dwt_y, decoder->decoding_width, decoder->decoding_height,
                                       decoder->header.decomp_levels, decoder->frame_count, decoder->header.quantiser_y);
 
         // Debug: Check LL band AFTER grain removal
@@ -2173,12 +2464,13 @@ static int decode_i_or_p_frame(tav_decoder_t *decoder, uint8_t packet_type, uint
 //        }
 
         // Apply inverse DWT with correct non-power-of-2 dimension handling
+        // Phase 2: Use decoding dimensions and temporary buffers
         // Note: quantised arrays freed at write_frame label
-        apply_inverse_dwt_multilevel(decoder->dwt_buffer_y, decoder->header.width, decoder->header.height,
+        apply_inverse_dwt_multilevel(temp_dwt_y, decoder->decoding_width, decoder->decoding_height,
                                    decoder->header.decomp_levels, decoder->header.wavelet_filter);
-        apply_inverse_dwt_multilevel(decoder->dwt_buffer_co, decoder->header.width, decoder->header.height,
+        apply_inverse_dwt_multilevel(temp_dwt_co, decoder->decoding_width, decoder->decoding_height,
                                    decoder->header.decomp_levels, decoder->header.wavelet_filter);
-        apply_inverse_dwt_multilevel(decoder->dwt_buffer_cg, decoder->header.width, decoder->header.height,
+        apply_inverse_dwt_multilevel(temp_dwt_cg, decoder->decoding_width, decoder->decoding_height,
                                    decoder->header.decomp_levels, decoder->header.wavelet_filter);
 
         // Debug: Check spatial domain values after IDWT
@@ -2202,46 +2494,68 @@ static int decode_i_or_p_frame(tav_decoder_t *decoder, uint8_t packet_type, uint
 //        }
 
         // Handle P-frame delta accumulation (in YCoCg float space)
+        // TODO Phase 2: P-frame support with crop encoding needs additional work
+        //  - Reference frames are stored at full size but delta may be at cropped size
+        //  - Need to extract/composite reference region appropriately
         if (packet_type == TAV_PACKET_PFRAME && mode == TAV_MODE_DELTA) {
-            for (int i = 0; i < decoder->frame_size; i++) {
-                decoder->dwt_buffer_y[i] += decoder->reference_ycocg_y[i];
-                decoder->dwt_buffer_co[i] += decoder->reference_ycocg_co[i];
-                decoder->dwt_buffer_cg[i] += decoder->reference_ycocg_cg[i];
+            fprintf(stderr, "Warning: P-frame delta mode not yet fully supported with crop encoding\n");
+            for (int i = 0; i < decoding_pixels; i++) {
+                temp_dwt_y[i] += decoder->reference_ycocg_y[i];
+                temp_dwt_co[i] += decoder->reference_ycocg_co[i];
+                temp_dwt_cg[i] += decoder->reference_ycocg_cg[i];
             }
         }
 
-        // Convert YCoCg-R/ICtCp to RGB
-        const int is_ictcp = (decoder->header.version % 2 == 0);
-        float max_y = -999, max_co = -999, max_cg = -999;
-        int max_r = 0, max_g = 0, max_b = 0;
+        // Phase 2: Convert cropped region to RGB, then composite to full frame
+        uint8_t *cropped_rgb = malloc(decoding_pixels * 3);
+        if (!cropped_rgb) {
+            fprintf(stderr, "Error: Failed to allocate cropped RGB buffer\n");
+            free(temp_dwt_y);
+            free(temp_dwt_co);
+            free(temp_dwt_cg);
+            decode_success = 0;
+            goto write_frame;
+        }
 
-        for (int i = 0; i < decoder->frame_size; i++) {
+        // Convert YCoCg-R/ICtCp to RGB for cropped region
+        // Extract base version for ICtCp check (even versions use ICtCp)
+        uint8_t base_version_rgb = (decoder->header.version > 8) ? (decoder->header.version - 8) : decoder->header.version;
+        const int is_ictcp = (base_version_rgb % 2 == 0);
+
+        for (int i = 0; i < decoding_pixels; i++) {
             uint8_t r, g, b;
             if (is_ictcp) {
-                ictcp_to_rgb(decoder->dwt_buffer_y[i],
-                           decoder->dwt_buffer_co[i],
-                           decoder->dwt_buffer_cg[i], &r, &g, &b);
+                ictcp_to_rgb(temp_dwt_y[i], temp_dwt_co[i], temp_dwt_cg[i], &r, &g, &b);
             } else {
-                ycocg_r_to_rgb(decoder->dwt_buffer_y[i],
-                             decoder->dwt_buffer_co[i],
-                             decoder->dwt_buffer_cg[i], &r, &g, &b);
+                ycocg_r_to_rgb(temp_dwt_y[i], temp_dwt_co[i], temp_dwt_cg[i], &r, &g, &b);
             }
 
-            // Track max values for debugging
-//            if (decoder->frame_count == 1000) {
-//                if (decoder->dwt_buffer_y[i] > max_y) max_y = decoder->dwt_buffer_y[i];
-//                if (decoder->dwt_buffer_co[i] > max_co) max_co = decoder->dwt_buffer_co[i];
-//                if (decoder->dwt_buffer_cg[i] > max_cg) max_cg = decoder->dwt_buffer_cg[i];
-//                if (r > max_r) max_r = r;
-//                if (g > max_g) max_g = g;
-//                if (b > max_b) max_b = b;
-//            }
-
             // RGB byte order for FFmpeg rgb24
-            decoder->current_frame_rgb[i * 3 + 0] = r;
-            decoder->current_frame_rgb[i * 3 + 1] = g;
-            decoder->current_frame_rgb[i * 3 + 2] = b;
+            cropped_rgb[i * 3 + 0] = r;
+            cropped_rgb[i * 3 + 1] = g;
+            cropped_rgb[i * 3 + 2] = b;
         }
+
+        // Composite cropped frame to full frame with black borders
+        uint8_t *full_frame_rgb = composite_to_full_frame(cropped_rgb,
+                                                           decoder->decoding_width, decoder->decoding_height,
+                                                           decoder->header.width, decoder->header.height,
+                                                           decoder->screen_mask_top, decoder->screen_mask_right,
+                                                           decoder->screen_mask_bottom, decoder->screen_mask_left);
+        free(cropped_rgb);
+        free(temp_dwt_y);
+        free(temp_dwt_co);
+        free(temp_dwt_cg);
+
+        if (!full_frame_rgb) {
+            fprintf(stderr, "Error: Failed to composite frame to full size\n");
+            decode_success = 0;
+            goto write_frame;
+        }
+
+        // Copy composited frame to decoder buffer
+        memcpy(decoder->current_frame_rgb, full_frame_rgb, decoder->frame_size * 3);
+        free(full_frame_rgb);
 
 //        if (decoder->frame_count == 1000) {
 //            fprintf(stderr, "\n=== Frame 1000 Value Analysis ===\n");
@@ -2261,10 +2575,12 @@ static int decode_i_or_p_frame(tav_decoder_t *decoder, uint8_t packet_type, uint
 //            fprintf(stderr, "\n");
 //        }
 
-        // Update reference YCoCg frame
-        memcpy(decoder->reference_ycocg_y, decoder->dwt_buffer_y, decoder->frame_size * sizeof(float));
-        memcpy(decoder->reference_ycocg_co, decoder->dwt_buffer_co, decoder->frame_size * sizeof(float));
-        memcpy(decoder->reference_ycocg_cg, decoder->dwt_buffer_cg, decoder->frame_size * sizeof(float));
+        // TODO Phase 2: Reference YCoCg frame update needs rework for crop encoding
+        // Currently not updated because we use temporary buffers that are already freed
+        // P-frame support will need to store reference at appropriate dimensions
+        // memcpy(decoder->reference_ycocg_y, temp_dwt_y, decoding_pixels * sizeof(float));
+        // memcpy(decoder->reference_ycocg_co, temp_dwt_co, decoding_pixels * sizeof(float));
+        // memcpy(decoder->reference_ycocg_cg, temp_dwt_cg, decoding_pixels * sizeof(float));
     }
 
     // Update reference frame
@@ -2486,6 +2802,61 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
+        // Handle screen masking packets (letterbox/pillarbox detection)
+        // Format: frame_num(4) + top(2) + right(2) + bottom(2) + left(2) = 12 bytes
+        if (packet_type == TAV_PACKET_SCREEN_MASK) {
+            uint32_t frame_num;
+            uint16_t top, right, bottom, left;
+            if (fread(&frame_num, 4, 1, decoder->input_fp) != 1 ||
+                fread(&top, 2, 1, decoder->input_fp) != 1 ||
+                fread(&right, 2, 1, decoder->input_fp) != 1 ||
+                fread(&bottom, 2, 1, decoder->input_fp) != 1 ||
+                fread(&left, 2, 1, decoder->input_fp) != 1) {
+                fprintf(stderr, "Error: Failed to read screen mask packet\n");
+                result = -1;
+                break;
+            }
+
+            // Allocate array if needed
+            if (decoder->screen_masks == NULL) {
+                decoder->screen_mask_capacity = 16;
+                decoder->screen_masks = malloc(decoder->screen_mask_capacity * sizeof(screen_mask_entry_t));
+                decoder->screen_mask_count = 0;
+            }
+
+            // Expand array if needed
+            if (decoder->screen_mask_count >= decoder->screen_mask_capacity) {
+                decoder->screen_mask_capacity *= 2;
+                decoder->screen_masks = realloc(decoder->screen_masks,
+                                               decoder->screen_mask_capacity * sizeof(screen_mask_entry_t));
+            }
+
+            // Store entry
+            screen_mask_entry_t *entry = &decoder->screen_masks[decoder->screen_mask_count++];
+            entry->frame_num = frame_num;
+            entry->top = top;
+            entry->right = right;
+            entry->bottom = bottom;
+            entry->left = left;
+
+            // Phase 2: Update current active mask and decoding dimensions
+            decoder->screen_mask_top = top;
+            decoder->screen_mask_right = right;
+            decoder->screen_mask_bottom = bottom;
+            decoder->screen_mask_left = left;
+
+            // Calculate new decoding dimensions (active region size)
+            decoder->decoding_width = decoder->header.width - left - right;
+            decoder->decoding_height = decoder->header.height - top - bottom;
+
+            if (verbose) {
+                fprintf(stderr, "Packet %d: SCREEN_MASK (0x%02X) - frame=%u top=%u right=%u bottom=%u left=%u (decoding: %dx%d)\n",
+                       total_packets, packet_type, frame_num, top, right, bottom, left,
+                       decoder->decoding_width, decoder->decoding_height);
+            }
+            continue;
+        }
+
         // Handle GOP unified packets (custom format: 1-byte gop_size + 4-byte compressed_size)
         if (packet_type == TAV_PACKET_GOP_UNIFIED) {
             uint8_t gop_size;
@@ -2546,27 +2917,47 @@ int main(int argc, char *argv[]) {
             }
 
             // Postprocess coefficients based on entropy_coder value
+            // Phase 2: Use decoding dimensions (actual encoded size) for postprocessing
+            int decoding_pixels = decoder->decoding_width * decoder->decoding_height;
+            // Keep full frame size for buffer allocation
             const int num_pixels = decoder->header.width * decoder->header.height;
             int16_t ***quantised_gop;
+
+            // GOP dimensions (may differ from full frame with crop encoding)
+            int gop_width = decoder->decoding_width;
+            int gop_height = decoder->decoding_height;
 
             if (decoder->header.entropy_coder == 2) {
                 // RAW format: simple concatenated int16 arrays
                 if (verbose) {
-                    fprintf(stderr, "  Using RAW postprocessing (entropy_coder=2)\n");
+                    fprintf(stderr, "  Using RAW postprocessing (entropy_coder=2) for %dx%d (%d pixels)\n",
+                           decoder->decoding_width, decoder->decoding_height, decoding_pixels);
                 }
                 quantised_gop = postprocess_gop_raw(decompressed_data, decompressed_size,
                                                    gop_size, num_pixels, decoder->header.channel_layout);
             } else if (decoder->header.entropy_coder == 1) {
                 // EZBC format: embedded zero-block coding
                 if (verbose) {
-                    fprintf(stderr, "  Using EZBC postprocessing (entropy_coder=1)\n");
+                    fprintf(stderr, "  Using EZBC postprocessing (entropy_coder=1) for %dx%d (%d pixels)\n",
+                           decoder->decoding_width, decoder->decoding_height, decoding_pixels);
                 }
+                // EZBC will return actual GOP dimensions (may be cropped with crop encoding)
                 quantised_gop = postprocess_gop_ezbc(decompressed_data, decompressed_size,
-                                                    gop_size, num_pixels, decoder->header.channel_layout);
+                                                    gop_size, num_pixels, decoder->header.channel_layout,
+                                                    &gop_width, &gop_height);
+                // Update decoding_pixels to match actual GOP dimensions
+                if (gop_width > 0 && gop_height > 0) {
+                    decoding_pixels = gop_width * gop_height;
+                    if (verbose) {
+                        fprintf(stderr, "  Actual GOP dimensions from EZBC: %dx%d (%d pixels)\n",
+                               gop_width, gop_height, decoding_pixels);
+                    }
+                }
             } else {
                 // Default: Twobitmap format (entropy_coder=0)
                 if (verbose) {
-                    fprintf(stderr, "  Using Twobitmap postprocessing (entropy_coder=0)\n");
+                    fprintf(stderr, "  Using Twobitmap postprocessing (entropy_coder=0) for %dx%d (%d pixels)\n",
+                           decoder->decoding_width, decoder->decoding_height, decoding_pixels);
                 }
                 quantised_gop = postprocess_gop_unified(decompressed_data, decompressed_size,
                                                        gop_size, num_pixels, decoder->header.channel_layout);
@@ -2581,18 +2972,21 @@ int main(int argc, char *argv[]) {
             }
 
             // Allocate GOP float buffers
+            // Phase 2: Allocate at decoding size (cropped region), will composite to full frame later
             float **gop_y = malloc(gop_size * sizeof(float *));
             float **gop_co = malloc(gop_size * sizeof(float *));
             float **gop_cg = malloc(gop_size * sizeof(float *));
 
             for (int t = 0; t < gop_size; t++) {
-                gop_y[t] = calloc(num_pixels, sizeof(float));
-                gop_co[t] = calloc(num_pixels, sizeof(float));
-                gop_cg[t] = calloc(num_pixels, sizeof(float));
+                gop_y[t] = calloc(decoding_pixels, sizeof(float));
+                gop_co[t] = calloc(decoding_pixels, sizeof(float));
+                gop_cg[t] = calloc(decoding_pixels, sizeof(float));
             }
 
             // Dequantise with temporal scaling (perceptual quantisation for versions 5-8)
-            const int is_perceptual = (decoder->header.version >= 5 && decoder->header.version <= 8);
+            // Extract base version for perceptual check
+            uint8_t base_version_gop = (decoder->header.version > 8) ? (decoder->header.version - 8) : decoder->header.version;
+            const int is_perceptual = (base_version_gop >= 5 && base_version_gop <= 8);
             const int is_ezbc = (decoder->header.entropy_coder == 1);
             const int temporal_levels = 2;  // Fixed for TAV GOP encoding
 
@@ -2608,17 +3002,18 @@ int main(int argc, char *argv[]) {
                     const float base_q_co = roundf(QLUT[decoder->header.quantiser_co] * temporal_scale);
                     const float base_q_cg = roundf(QLUT[decoder->header.quantiser_cg] * temporal_scale);
 
+                    // Phase 2: Use GOP dimensions (may be cropped) for dequantisation
                     dequantise_dwt_subbands_perceptual(0, QLUT[decoder->header.quantiser_y],
                                                       quantised_gop[t][0], gop_y[t],
-                                                      decoder->header.width, decoder->header.height,
+                                                      gop_width, gop_height,
                                                       decoder->header.decomp_levels, base_q_y, 0, decoder->frame_count + t);
                     dequantise_dwt_subbands_perceptual(0, QLUT[decoder->header.quantiser_y],
                                                       quantised_gop[t][1], gop_co[t],
-                                                      decoder->header.width, decoder->header.height,
+                                                      gop_width, gop_height,
                                                       decoder->header.decomp_levels, base_q_co, 1, decoder->frame_count + t);
                     dequantise_dwt_subbands_perceptual(0, QLUT[decoder->header.quantiser_y],
                                                       quantised_gop[t][2], gop_cg[t],
-                                                      decoder->header.width, decoder->header.height,
+                                                      gop_width, gop_height,
                                                       decoder->header.decomp_levels, base_q_cg, 1, decoder->frame_count + t);
 
                     if (t == 0 && verbose) {
@@ -2643,21 +3038,23 @@ int main(int argc, char *argv[]) {
                     const float base_q_cg = roundf(QLUT[decoder->header.quantiser_cg] * temporal_scale);
 
                     if (is_perceptual) {
+                        // Phase 2: Use GOP dimensions (may be cropped) for dequantisation
                         dequantise_dwt_subbands_perceptual(0, QLUT[decoder->header.quantiser_y],
                                                           quantised_gop[t][0], gop_y[t],
-                                                          decoder->header.width, decoder->header.height,
+                                                          gop_width, gop_height,
                                                           decoder->header.decomp_levels, base_q_y, 0, decoder->frame_count + t);
                         dequantise_dwt_subbands_perceptual(0, QLUT[decoder->header.quantiser_y],
                                                           quantised_gop[t][1], gop_co[t],
-                                                          decoder->header.width, decoder->header.height,
+                                                          gop_width, gop_height,
                                                           decoder->header.decomp_levels, base_q_co, 1, decoder->frame_count + t);
                         dequantise_dwt_subbands_perceptual(0, QLUT[decoder->header.quantiser_y],
                                                           quantised_gop[t][2], gop_cg[t],
-                                                          decoder->header.width, decoder->header.height,
+                                                          gop_width, gop_height,
                                                           decoder->header.decomp_levels, base_q_cg, 1, decoder->frame_count + t);
                     } else {
                         // Uniform quantisation for older versions
-                        for (int i = 0; i < num_pixels; i++) {
+                        // Phase 2: Use decoding_pixels for uniform dequantisation
+                        for (int i = 0; i < decoding_pixels; i++) {
                             gop_y[t][i] = quantised_gop[t][0][i] * base_q_y;
                             gop_co[t][i] = quantised_gop[t][1][i] * base_q_co;
                             gop_cg[t][i] = quantised_gop[t][2][i] * base_q_cg;
@@ -2676,16 +3073,18 @@ int main(int argc, char *argv[]) {
             free(quantised_gop);
 
 
+            // Phase 2: Use GOP dimensions (may be cropped) for grain removal
             for (int t = 0; t < gop_size; t++) {
-                remove_grain_synthesis_decoder(gop_y[t], decoder->header.width, decoder->header.height,
+                remove_grain_synthesis_decoder(gop_y[t], gop_width, gop_height,
                                               decoder->header.decomp_levels, decoder->frame_count + t,
                                               decoder->header.quantiser_y);
             }
 
             // Apply inverse 3D DWT (spatial + temporal)
-            apply_inverse_3d_dwt(gop_y, gop_co, gop_cg, decoder->header.width, decoder->header.height,
+            // Phase 2: Use GOP dimensions (may be cropped) for inverse DWT
+            apply_inverse_3d_dwt(gop_y, gop_co, gop_cg, gop_width, gop_height,
                                gop_size, decoder->header.decomp_levels, temporal_levels,
-                               decoder->header.wavelet_filter);
+                               decoder->header.wavelet_filter, decoder->temporal_motion_coder);
 
             // Debug: Check Y values after inverse DWT
             if (verbose && decoder->frame_count == 0) {
@@ -2716,27 +3115,78 @@ int main(int argc, char *argv[]) {
 //                       (size_t)decoder->frame_size * 3, decoder->header.width * decoder->header.height * 3);
 //            }
 
+            // Calculate consistent screen mask offsets for crop-encoded GOPs
+            // When crop encoding is active, all frames in GOP use same dimensions
+            const int is_crop_encoded = (gop_width != decoder->header.width ||
+                                        gop_height != decoder->header.height);
+            uint16_t gop_mask_top = 0, gop_mask_bottom = 0, gop_mask_left = 0, gop_mask_right = 0;
+
+            if (is_crop_encoded) {
+                // Center the cropped region in the full frame
+                if (gop_height < decoder->header.height) {
+                    gop_mask_top = (decoder->header.height - gop_height) / 2;
+                    gop_mask_bottom = decoder->header.height - gop_height - gop_mask_top;
+                }
+                if (gop_width < decoder->header.width) {
+                    gop_mask_left = (decoder->header.width - gop_width) / 2;
+                    gop_mask_right = decoder->header.width - gop_width - gop_mask_left;
+                }
+                if (verbose && decoder->frame_count == 0) {
+                    fprintf(stderr, "[GOP-Crop] Centering %dx%d in %dx%d: top=%u, bottom=%u, left=%u, right=%u\n",
+                           gop_width, gop_height, decoder->header.width, decoder->header.height,
+                           gop_mask_top, gop_mask_bottom, gop_mask_left, gop_mask_right);
+                }
+            }
+
             for (int t = 0; t < gop_size; t++) {
-                // Allocate frame buffer
-                uint8_t *frame_rgb = malloc(decoder->frame_size * 3);
-                if (!frame_rgb) {
-                    fprintf(stderr, "Error: Failed to allocate GOP frame buffer\n");
+                // Update screen mask only if NOT crop-encoded
+                // Crop-encoded GOPs use consistent offsets calculated above
+                if (!is_crop_encoded) {
+                    update_screen_mask(decoder, decoder->frame_count + t);
+                }
+
+                // Phase 2: Convert cropped region to RGB, then composite to full frame
+                uint8_t *cropped_rgb = malloc(decoding_pixels * 3);
+                if (!cropped_rgb) {
+                    fprintf(stderr, "Error: Failed to allocate cropped GOP frame buffer\n");
                     result = -1;
                     break;
                 }
 
-                // Convert to RGB
-                for (int i = 0; i < decoder->frame_size; i++) {
+                // Convert cropped region to RGB
+                for (int i = 0; i < decoding_pixels; i++) {
                     uint8_t r, g, b;
                     if (is_ictcp) {
                         ictcp_to_rgb(gop_y[t][i], gop_co[t][i], gop_cg[t][i], &r, &g, &b);
                     } else {
                         ycocg_r_to_rgb(gop_y[t][i], gop_co[t][i], gop_cg[t][i], &r, &g, &b);
                     }
-                    frame_rgb[i * 3 + 0] = r;
-                    frame_rgb[i * 3 + 1] = g;
-                    frame_rgb[i * 3 + 2] = b;
+                    cropped_rgb[i * 3 + 0] = r;
+                    cropped_rgb[i * 3 + 1] = g;
+                    cropped_rgb[i * 3 + 2] = b;
                 }
+
+                // Composite cropped frame to full frame with black borders
+                // Use GOP-consistent offsets for crop-encoded, or per-frame offsets otherwise
+                const uint16_t mask_top = is_crop_encoded ? gop_mask_top : decoder->screen_mask_top;
+                const uint16_t mask_bottom = is_crop_encoded ? gop_mask_bottom : decoder->screen_mask_bottom;
+                const uint16_t mask_left = is_crop_encoded ? gop_mask_left : decoder->screen_mask_left;
+                const uint16_t mask_right = is_crop_encoded ? gop_mask_right : decoder->screen_mask_right;
+
+                uint8_t *frame_rgb = composite_to_full_frame(cropped_rgb,
+                                                             gop_width, gop_height,
+                                                             decoder->header.width, decoder->header.height,
+                                                             mask_top, mask_right, mask_bottom, mask_left);
+                free(cropped_rgb);
+
+                if (!frame_rgb) {
+                    fprintf(stderr, "Error: Failed to composite GOP frame to full size\n");
+                    result = -1;
+                    break;
+                }
+
+                // Note: Phase 1 fill_masked_regions() is now replaced by Phase 2 composite function
+                // which places the decoded cropped frame into a full-frame buffer with black borders
 
                 // Write frame to FFmpeg video pipe
                 const size_t bytes_to_write = decoder->frame_size * 3;
@@ -2869,6 +3319,9 @@ int main(int argc, char *argv[]) {
         switch (packet_type) {
             case TAV_PACKET_IFRAME:
             case TAV_PACKET_PFRAME:
+                // Update active screen mask for this frame (Phase 1: just tracking, not applying)
+                update_screen_mask(decoder, decoder->frame_count);
+
                 iframe_count++;
                 if (verbose && iframe_count <= 5) {
                     fprintf(stderr, "Processing %s (packet %d, size %u bytes)...\n",
@@ -2902,6 +3355,7 @@ int main(int argc, char *argv[]) {
                 break;
 
             case TAV_PACKET_SUBTITLE:
+            case TAV_PACKET_SUBTITLE_TC:
                 // Skip subtitle packets
                 fseek(decoder->input_fp, packet_size, SEEK_CUR);
                 break;

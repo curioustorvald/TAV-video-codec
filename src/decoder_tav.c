@@ -11,11 +11,13 @@
 #include <zstd.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/time.h>
 #include <getopt.h>
 #include <signal.h>
 #include "decoder_tad.h"  // Shared TAD decoder library
+#include "tav_avx512.h"  // AVX-512 SIMD optimisations
 
-#define DECODER_VENDOR_STRING "Decoder-TAV 20251103 (ffv1+pcmu8)"
+#define DECODER_VENDOR_STRING "Decoder-TAV 20251124 (avx512,presets)"
 
 // TAV format constants
 #define TAV_MAGIC "\x1F\x54\x53\x56\x4D\x54\x41\x56"
@@ -93,7 +95,8 @@ typedef struct {
     uint8_t encoder_quality;
     uint8_t channel_layout;
     uint8_t entropy_coder;
-    uint8_t reserved[2];
+    uint8_t encoder_preset;  // Byte 28: bit 0 = sports, bit 1 = anime
+    uint8_t reserved;
     uint8_t device_orientation;
     uint8_t file_role;
 } __attribute__((packed)) tav_header_t;
@@ -311,13 +314,31 @@ static void dequantise_dwt_subbands_perceptual(int q_index, int q_y_global, cons
         //                   Decoder must multiply by effective quantiser to denormalize
         //                   Previous denormalization in EZBC caused int16_t overflow (clipping at 32767)
         //                   for bright pixels, creating dark DWT-pattern blemishes
-        for (int i = 0; i < subband->coeff_count; i++) {
-            const int idx = subband->coeff_start + i;
-            if (idx < coeff_count) {
-                const float untruncated = quantised[idx] * effective_quantiser;
-                dequantised[idx] = untruncated;
+
+#ifdef __AVX512F__
+        // Use AVX-512 optimised dequantization if available (1.1x speedup against -Ofast)
+        // Check: subband has >=16 elements AND won't exceed buffer bounds
+        const int subband_end = subband->coeff_start + subband->coeff_count;
+        if (g_simd_level >= SIMD_AVX512F && subband->coeff_count >= 16 && subband_end <= coeff_count) {
+            dequantise_dwt_coefficients_avx512(
+                quantised + subband->coeff_start,
+                dequantised + subband->coeff_start,
+                subband->coeff_count,
+                effective_quantiser
+            );
+        } else {
+#endif
+            // Scalar fallback or small subbands
+            for (int i = 0; i < subband->coeff_count; i++) {
+                const int idx = subband->coeff_start + i;
+                if (idx < coeff_count) {
+                    const float untruncated = quantised[idx] * effective_quantiser;
+                    dequantised[idx] = untruncated;
+                }
             }
+#ifdef __AVX512F__
         }
+#endif
     }
 
     // Debug: Verify LL band was dequantised correctly
@@ -374,10 +395,20 @@ static inline float tav_grain_triangular_noise(uint32_t rng_val) {
     return (u1 + u2) - 1.0f;
 }
 
-// Remove grain synthesis from DWT coefficients (decoder subtracts noise)
+// Apply grain synthesis from DWT coefficients (decoder subtracts noise)
 // This must be called AFTER dequantisation but BEFORE inverse DWT
-static void remove_grain_synthesis_decoder(float *coeffs, int width, int height,
-                                          int decomp_levels, int frame_num, int q_y_global) {
+static void apply_grain_synthesis(float *coeffs, int width, int height,
+                                          int decomp_levels, int frame_num, int q_y_global, uint8_t encoder_preset, int no_grain_synthesis) {
+    // Command-line override: disable grain synthesis
+    if (no_grain_synthesis) {
+        return;  // Skip grain synthesis entirely
+    }
+
+    // Anime preset: completely disable grain synthesis
+    if (encoder_preset & 0x02) {
+        return;  // Skip grain synthesis entirely
+    }
+
     dwt_subband_info_t subbands[32];
     const int subband_count = calculate_subband_layout(width, height, decomp_levels, subbands);
 
@@ -392,7 +423,7 @@ static void remove_grain_synthesis_decoder(float *coeffs, int width, int height,
         // Calculate band index for RNG (matches Kotlin: level + subbandType * 31 + 16777619)
         uint32_t band = subband->level + subband->subband_type * 31 + 16777619;
 
-        // Remove noise from each coefficient in this subband
+        // Apply noise from each coefficient in this subband
         for (int i = 0; i < subband->coeff_count; i++) {
             const int idx = subband->coeff_start + i;
             if (idx < width * height) {
@@ -1023,6 +1054,52 @@ static void dwt_53_inverse_1d(float *data, int length) {
     free(temp);
 }
 
+// Biorthogonal 2,4 (LeGall 2/4) INVERSE 1D transform
+static void dwt_bior24_inverse_1d(float *data, int length) {
+    if (length < 2) return;
+
+    float *temp = malloc(sizeof(float) * length);
+    int half = (length + 1) / 2;
+    int i;
+
+    int nE = half;
+    int nO = length / 2;
+
+    float *even = temp;
+    float *odd  = temp + nE;
+
+    // Load L and H
+    for (i = 0; i < nE; i++) {
+        even[i] = data[i];
+    }
+    for (i = 0; i < nO; i++) {
+        odd[i] = data[half + i];
+    }
+
+    // ---- Inverse update: s[i] = s[i] - 0.25*d[i] ----
+    for (i = 0; i < nE; i++) {
+        float d = (i < nO) ? odd[i] : 0.0f;
+        even[i] = even[i] - 0.25f * d;
+    }
+
+    // ---- Inverse predict: o[i] = d[i] + 0.5*s[i] ----
+    for (i = 0; i < nO; i++) {
+        odd[i] = odd[i] + 0.5f * even[i];
+    }
+
+    // Interleave back into output
+    for (i = 0; i < nO; i++) {
+        data[2 * i]     = even[i];
+        data[2 * i + 1] = odd[i];
+    }
+    if (nE > nO) {
+        // Trailing even sample for odd length
+        data[2 * nO] = even[nO];
+    }
+
+    free(temp);
+}
+
 // Multi-level inverse DWT (matches TSVM exactly with correct non-power-of-2 handling)
 static void apply_inverse_dwt_multilevel(float *data, int width, int height, int levels, int filter_type) {
     int max_size = (width > height) ? width : height;
@@ -1044,14 +1121,14 @@ static void apply_inverse_dwt_multilevel(float *data, int width, int height, int
     }
 
     // Debug: Print dimension sequence
-    static int debug_once = 1;
+    /*static int debug_once = 1;
     if (debug_once) {
         fprintf(stderr, "DWT dimension sequence for %dx%d with %d levels:\n", width, height, levels);
         for (int i = 0; i <= levels; i++) {
             fprintf(stderr, "  Level %d: %dx%d\n", i, widths[i], heights[i]);
         }
         debug_once = 0;
-    }
+    }*/
 
     // TSVM: for (level in levels - 1 downTo 0)
     // Apply inverse transforms using pre-calculated dimensions
@@ -1160,14 +1237,14 @@ static int get_temporal_subband_level(int frame_idx, int num_frames, int tempora
 }
 
 // Calculate temporal quantiser scale for a given temporal subband level
-static float get_temporal_quantiser_scale(int temporal_level) {
+static float get_temporal_quantiser_scale(uint8_t encoder_preset, int temporal_level) {
     // Uses exponential scaling: 2^(BETA × level^KAPPA)
     // With BETA=0.6, KAPPA=1.14:
     //   - Level 0 (tLL):  2^0.0 = 1.00
     //   - Level 1 (tH):   2^0.68 = 1.61
     //   - Level 2 (tHH):  2^1.29 = 2.45
-    const float BETA = 0.6f;  // Temporal scaling exponent
-    const float KAPPA = 1.14f;
+    const float BETA = (encoder_preset & 0x01) ? 0.0f : 0.6f;
+    const float KAPPA = (encoder_preset & 0x01) ? 1.0f : 1.14f;
     return powf(2.0f, BETA * powf(temporal_level, KAPPA));
 }
 
@@ -1746,6 +1823,7 @@ typedef struct {
     int frame_size;
     int is_monoblock;           // True if version 3-6 (single tile mode)
     int temporal_motion_coder;  // Temporal wavelet: 0=Haar, 1=CDF 5/3 (extracted from version)
+    int no_grain_synthesis;     // Command-line flag: disable grain synthesis
 
     // Screen masking (letterbox/pillarbox) - array of geometry changes
     screen_mask_entry_t *screen_masks;
@@ -1957,10 +2035,11 @@ static int extract_audio_to_wav(const char *input_file, const char *wav_file, in
 // Decoder Initialisation and Cleanup
 //=============================================================================
 
-static tav_decoder_t* tav_decoder_init(const char *input_file, const char *output_file, const char *audio_file) {
+static tav_decoder_t* tav_decoder_init(const char *input_file, const char *output_file, const char *audio_file, int no_grain_synthesis) {
     tav_decoder_t *decoder = calloc(1, sizeof(tav_decoder_t));
     if (!decoder) return NULL;
 
+    decoder->no_grain_synthesis = no_grain_synthesis;
     decoder->input_fp = fopen(input_file, "rb");
     if (!decoder->input_fp) {
         free(decoder);
@@ -2445,8 +2524,9 @@ static int decode_i_or_p_frame(tav_decoder_t *decoder, uint8_t packet_type, uint
 
         // Remove grain synthesis from Y channel (must happen after dequantisation, before inverse DWT)
         // Phase 2: Use decoding dimensions and temporary buffer
-        remove_grain_synthesis_decoder(temp_dwt_y, decoder->decoding_width, decoder->decoding_height,
-                                      decoder->header.decomp_levels, decoder->frame_count, decoder->header.quantiser_y);
+        apply_grain_synthesis(temp_dwt_y, decoder->decoding_width, decoder->decoding_height,
+                                      decoder->header.decomp_levels, decoder->frame_count, decoder->header.quantiser_y,
+                                      decoder->header.encoder_preset, decoder->no_grain_synthesis);
 
         // Debug: Check LL band AFTER grain removal
 //        if (decoder->frame_count == 32) {
@@ -2646,10 +2726,11 @@ static void print_usage(const char *prog) {
     printf("Version: %s\n\n", DECODER_VENDOR_STRING);
     printf("Usage: %s -i input.tav -o output.mkv\n\n", prog);
     printf("Options:\n");
-    printf("  -i <file>    Input TAV file\n");
-    printf("  -o <file>    Output MKV file (FFV1 video + PCMu8 audio)\n");
-    printf("  -v           Verbose output\n");
-    printf("  -h, --help   Show this help\n\n");
+    printf("  -i <file>              Input TAV file\n");
+    printf("  -o <file>              Output MKV file (optional, auto-generated from input)\n");
+    printf("  -v                     Verbose output\n");
+    printf("  --no-grain-synthesis   Disable grain synthesis (override encoder preset)\n");
+    printf("  -h, --help             Show this help\n\n");
     printf("Supported features (matches TSVM decoder):\n");
     printf("  - I-frames and P-frames (delta mode)\n");
     printf("  - GOP unified 3D DWT (temporal compression)\n");
@@ -2668,12 +2749,17 @@ int main(int argc, char *argv[]) {
     // Ignore SIGPIPE to prevent process termination if FFmpeg exits early
     signal(SIGPIPE, SIG_IGN);
 
+    // Initialize AVX-512 runtime detection
+    tav_simd_init();
+
     char *input_file = NULL;
     char *output_file = NULL;
     int verbose = 0;
+    int no_grain_synthesis = 0;
 
     static struct option long_options[] = {
         {"help", no_argument, 0, 'h'},
+        {"no-grain-synthesis", no_argument, 0, 1000},
         {0, 0, 0, 0}
     };
 
@@ -2692,16 +2778,56 @@ int main(int argc, char *argv[]) {
             case 'h':
                 print_usage(argv[0]);
                 return 0;
+            case 1000:  // --no-grain-synthesis
+                no_grain_synthesis = 1;
+                if (verbose) {
+                    printf("Grain synthesis disabled\n");
+                }
+                break;
             default:
                 print_usage(argv[0]);
                 return 1;
         }
     }
 
-    if (!input_file || !output_file) {
-        fprintf(stderr, "Error: Both input and output files are required\n\n");
+    if (!input_file) {
+        fprintf(stderr, "Error: Input file is required\n\n");
         print_usage(argv[0]);
         return 1;
+    }
+
+    // Generate output filename if not provided
+    if (!output_file) {
+        size_t input_len = strlen(input_file);
+        output_file = malloc(input_len + 32);  // Extra space for extension
+
+        // Find the last directory separator
+        const char *basename_start = strrchr(input_file, '/');
+        if (!basename_start) basename_start = strrchr(input_file, '\\');
+        basename_start = basename_start ? basename_start + 1 : input_file;
+
+        // Copy directory part
+        size_t dir_len = basename_start - input_file;
+        strncpy(output_file, input_file, dir_len);
+
+        // Find the .tad extension
+        const char *ext = strrchr(basename_start, '.');
+        if (ext && (strcmp(ext, ".tav") == 0 || strcmp(ext, ".mv3") == 0)) {
+            // Copy basename without .tav or .mv3
+            size_t name_len = ext - basename_start;
+            strncpy(output_file + dir_len, basename_start, name_len);
+            output_file[dir_len + name_len] = '\0';
+        } else {
+            // No .tad extension, copy entire basename
+            strcpy(output_file + dir_len, basename_start);
+        }
+
+        // Append appropriate extension
+        strcat(output_file, ".mkv");
+
+        if (verbose) {
+            printf("Auto-generated output path: %s\n", output_file);
+        }
     }
 
     // Create temporary audio file path
@@ -2716,7 +2842,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Pass 2: Decode video with audio file
-    tav_decoder_t *decoder = tav_decoder_init(input_file, output_file, temp_audio_file);
+    tav_decoder_t *decoder = tav_decoder_init(input_file, output_file, temp_audio_file, no_grain_synthesis);
     if (!decoder) {
         fprintf(stderr, "Failed to initialise decoder\n");
         unlink(temp_audio_file);  // Clean up temp file
@@ -2737,6 +2863,12 @@ int main(int argc, char *argv[]) {
                decoder->is_monoblock ? "monoblock" : "tiled");
         printf("Output: %s (FFV1 level 3 + PCMu8 @ 32 KHz)\n", output_file);
     }
+
+    // Start timing for FPS calculation
+    struct timeval start_time, last_update_time;
+    gettimeofday(&start_time, NULL);
+    last_update_time = start_time;
+    int frames_since_last_update = 0;
 
     // Main decoding loop
     int result = 1;
@@ -2799,6 +2931,28 @@ int main(int argc, char *argv[]) {
             }
             // Update decoder frame count (GOP already wrote frames)
             decoder->frame_count += gop_frame_count;
+            frames_since_last_update += gop_frame_count;
+
+            // Print progress every second or so
+            struct timeval current_time;
+            gettimeofday(&current_time, NULL);
+            double time_since_update = (current_time.tv_sec - last_update_time.tv_sec) +
+                                     (current_time.tv_usec - last_update_time.tv_usec) / 1000000.0;
+
+            if (time_since_update >= 1.0 || decoder->frame_count == gop_frame_count) {  // Update every second
+                double total_time = (current_time.tv_sec - start_time.tv_sec) +
+                                  (current_time.tv_usec - start_time.tv_usec) / 1000000.0;
+                double current_fps = frames_since_last_update / time_since_update;
+                double avg_fps = decoder->frame_count / total_time;
+
+                fprintf(stderr, "\rDecoding: Frame %d (%.1f fps, avg %.1f fps)    ",
+                       decoder->frame_count, current_fps, avg_fps);
+                fflush(stderr);
+
+                last_update_time = current_time;
+                frames_since_last_update = 0;
+            }
+
             continue;
         }
 
@@ -2995,7 +3149,7 @@ int main(int argc, char *argv[]) {
                     // EZBC mode with perceptual quantisation: coefficients are normalised
                     // Need to dequantise using perceptual weights (same as twobit-map mode)
                     const int temporal_level = get_temporal_subband_level(t, gop_size, temporal_levels);
-                    const float temporal_scale = get_temporal_quantiser_scale(temporal_level);
+                    const float temporal_scale = get_temporal_quantiser_scale(decoder->header.encoder_preset, temporal_level);
 
                     // FIX: Use QLUT to convert header quantiser indices to actual values
                     const float base_q_y = roundf(QLUT[decoder->header.quantiser_y] * temporal_scale);
@@ -3029,7 +3183,7 @@ int main(int argc, char *argv[]) {
                 } else if (!is_ezbc) {
                     // Normal mode: multiply by quantiser
                     const int temporal_level = get_temporal_subband_level(t, gop_size, temporal_levels);
-                    const float temporal_scale = get_temporal_quantiser_scale(temporal_level);
+                    const float temporal_scale = get_temporal_quantiser_scale(decoder->header.encoder_preset, temporal_level);
 
                     // CRITICAL: Must ROUND temporal quantiser to match encoder's roundf() behavior
                     // FIX: Use QLUT to convert header quantiser indices to actual values
@@ -3075,9 +3229,10 @@ int main(int argc, char *argv[]) {
 
             // Phase 2: Use GOP dimensions (may be cropped) for grain removal
             for (int t = 0; t < gop_size; t++) {
-                remove_grain_synthesis_decoder(gop_y[t], gop_width, gop_height,
+                apply_grain_synthesis(gop_y[t], gop_width, gop_height,
                                               decoder->header.decomp_levels, decoder->frame_count + t,
-                                              decoder->header.quantiser_y);
+                                              decoder->header.quantiser_y, decoder->header.encoder_preset,
+                                              decoder->no_grain_synthesis);
             }
 
             // Apply inverse 3D DWT (spatial + temporal)
@@ -3333,10 +3488,28 @@ int main(int argc, char *argv[]) {
                     fprintf(stderr, "Error: Frame decoding failed at frame %d\n", decoder->frame_count);
                     break;
                 }
-                if (verbose && decoder->frame_count % 100 == 0) {
-                    printf("Decoded frame %d\r", decoder->frame_count);
-                    fflush(stdout);
+
+                // Update progress indicator
+                frames_since_last_update++;
+                struct timeval current_time;
+                gettimeofday(&current_time, NULL);
+                double time_since_update = (current_time.tv_sec - last_update_time.tv_sec) +
+                                         (current_time.tv_usec - last_update_time.tv_usec) / 1000000.0;
+
+                if (time_since_update >= 1.0 || decoder->frame_count == 1) {  // Update every second
+                    double total_time = (current_time.tv_sec - start_time.tv_sec) +
+                                      (current_time.tv_usec - start_time.tv_usec) / 1000000.0;
+                    double current_fps = frames_since_last_update / time_since_update;
+                    double avg_fps = decoder->frame_count / total_time;
+
+                    fprintf(stderr, "\rDecoding: Frame %d (%.1f fps, avg %.1f fps)    ",
+                           decoder->frame_count, current_fps, avg_fps);
+                    fflush(stderr);
+
+                    last_update_time = current_time;
+                    frames_since_last_update = 0;
                 }
+
                 break;
 
             case TAV_PACKET_AUDIO_MP2:
@@ -3373,6 +3546,12 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // Calculate final statistics
+    struct timeval end_time;
+    gettimeofday(&end_time, NULL);
+    double total_time = (end_time.tv_sec - start_time.tv_sec) +
+                       (end_time.tv_usec - start_time.tv_usec) / 1000000.0;
+
     if (verbose) {
         printf("\nDecoded %d frames\n", decoder->frame_count);
     }
@@ -3385,7 +3564,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("Successfully decoded to: %s\n", output_file);
+    // Print final statistics (similar to encoder)
+    fprintf(stderr, "\n");  // Clear progress line
+    printf("\nDecoding complete!\n");
+    printf("  Frames decoded: %d\n", decoder->frame_count);
+    printf("  Decoding time: %.2fs (%.1f fps)\n", total_time, decoder->frame_count / total_time);
+    printf("  Output: %s\n", output_file);
 
     // Clean up temporary audio file
     if (unlink(temp_audio_file) == 0 && verbose) {

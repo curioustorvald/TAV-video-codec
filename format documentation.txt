@@ -16,36 +16,52 @@ transmission capability, and region-of-interest coding.
 
 ## Header (32 bytes)
     uint8  Magic[8]: "\x1F TSVM TAV" or "\x1F TSVM TAP"
-    uint8  Version: 3 (YCoCg-R uniform), 4 (ICtCp uniform), 5 (YCoCg-R perceptual), 6 (ICtCp perceptual)
-    uint16 Width: video width in pixels
-    uint16 Height: video height in pixels
-    uint8  FPS: frames per second. Use 0x00 for still images
+    uint8  Version:
+            Base version number:
+            - 1 = YCoCg-R multi-tile uniform
+            - 2 = ICtCp multi-tile uniform
+            - 3 = YCoCg-R monoblock uniform
+            - 4 = ICtCp monoblock uniform
+            - 5 = YCoCg-R monoblock perceptual
+            - 6 = ICtCp monoblock perceptual
+            - 7 = YCoCg-R multi-tile perceptual
+            - 8 = ICtCp multi-tile perceptual
+            When motion coder is Haar, take base version number.
+            When motion coder is CDF 5/3, add 8 to the base version number.
+    uint16 Width: picture width in pixels. Columns count for Videotex-only file.
+    uint16 Height: picture height in pixels. Rows count for Videotex-only file.
+    uint8  FPS: frames per second. Use 0x00 for still pictures
     uint32 Total Frames: number of video frames
             - use 0 to denote not-finalised video stream
-            - use 0xFFFFFFFF to denote still image (.im3 file)
+            - use 0xFFFFFFFF to denote still picture (.im3 file)
     uint8  Wavelet Filter Type:
             - 0 = 5/3 reversible (LGT 5/3, JPEG 2000 standard)
             - 1 = 9/7 irreversible (CDF 9/7, slight modification of JPEG 2000, default choice)
             - 2 = CDF 13/7 (experimental)
             - 16 = DD-4 (Four-point interpolating Deslauriers-Dubuc; experimental)
             - 255 = Haar (demonstration purpose only)
-    uint8  Decomposition Levels: number of DWT levels (1-6+)
+    uint8  Decomposition Levels: number of DWT levels (1-6+; use 0 if it has no video or Videotex only)
     uint8  Quantiser Index for Y channel (uses exponential numeric system; 0: lossless, 255: potato)
     uint8  Quantiser Index for Co channel (uses exponential numeric system; 0: lossless, 255: potato)
     uint8  Quantiser Index for Cg channel (uses exponential numeric system; 0: lossless, 255: potato)
-    uint8  Extra Feature Flags (must be ignored for still images)
-            - bit 0 = has audio
-            - bit 1 = has subtitle
-            - bit 2 = infinite loop (must be ignored when File Role is 1)
+    uint8  Extra Feature Flags
+            - bit 0 = has audio (for still pictures: has background music)
+            - bit 1 = has subtitle (for still pictures: has timed captions)
+            - bit 2 = infinite loop (has no effect for still pictures)
             - bit 7 = has no actual packets, this file is header-only without an Intro Movie
     uint8  Video Flags
             - bit 0 = interlaced
             - bit 1 = is NTSC framerate
             - bit 2 = is lossless mode
                 (shorthand for `-q 6 -Q0,0,0 -w 0 --intra-only --no-perceptual-tuning --arate 384`)
-            - bit 3 = has region-of-interest coding (for still images only)
+            - bit 3 = has region-of-interest coding (for still pictures only)
+            - bit 4 = reserved (crop encoding?)
+            - bit 7 = has no video
     uint8  Encoder quality level (stored with bias of 1 (q0=1); used to derive anisotropy value)
     uint8  Channel layout (bit-field: bit 0=has alpha, bit 1=has chroma inverted, bit 2=has luma inverted)
+            * Luma-only videos must be decoded with fixed Chroma=0
+            * Chroma-only videos must be decoded with fixed Luma=127
+            * No-alpha videos must be decoded with fixed Alpha=255
             - 0 = Y-Co-Cg/I-Ct-Cp (000: no alpha, has chroma, has luma)
             - 1 = Y-Co-Cg-A/I-Ct-Cp-A (001: has alpha, has chroma, has luma)
             - 2 = Y/I only (010: no alpha, no chroma, has luma)
@@ -54,10 +70,16 @@ transmission capability, and region-of-interest coding.
             - 5 = Co-Cg-A/Ct-Cp-A (101: has alpha, has chroma, no luma)
             - 6-7 = Reserved/invalid (would indicate no luma and no chroma)
     uint8  Entropy Coder
-            - 0 = Twobit-plane significance map
+            - 0 = Twobit-plane significance map (deprecated)
             - 1 = Embedded Zero Block Coding
-            - 2 = Raw coefficients
-    uint8  Reserved[2]: fill with zeros
+            - 2 = Raw coefficients (debugging purpose only)
+    uint8  Encoder Preset
+            - Bit 0 = use finer motion (finer temporal quantisation)
+            - Bit 1 = reduce grain synthesis
+            Preset "Default" -> 0x00
+            Preset "Sports" -> 0x01
+            Preset "Anime" -> 0x02
+    uint8  Reserved[1]: fill with zeros
     uint8  Device Orientation
             - 0 = No rotation
             - 1 = Clockwise 90 deg

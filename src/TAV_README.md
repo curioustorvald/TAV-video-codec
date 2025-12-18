@@ -1,6 +1,6 @@
 # TAV - TSVM Advanced Video Codec
 
-A perceptually-optimised wavelet-based video codec designed for resource-constrained systems, featuring multiple wavelet types, temporal 3D DWT, and sophisticated compression techniques.
+A perceptually-optimised wavelet-based video codec designed for resource-constrained systems.
 
 ## Overview
 
@@ -71,8 +71,8 @@ make clean
 
 ### Build Targets
 
-- `encoder_tav` - Main video encoder
-- `decoder_tav` - Standalone video decoder
+- `encoder_tav_ref` - Main video encoder
+- `decoder_tav_ref` - Standalone video decoder
 - `tav_inspector` - Packet analysis and debugging tool
 
 ## Usage
@@ -83,25 +83,25 @@ Encoding requires FFmpeg executable installed in your system.
 
 ```bash
 # Default encoding (CDF 9/7 wavelet, quality level 3)
-./encoder_tav -i input.mp4 -o output.tav
+./encoder_tav_ref -i input.mp4 -o output.tav
 
 # Quality levels (0-5)
-./encoder_tav -i input.avi -q 0 -o output.tav    # Lowest quality, smallest file
-./encoder_tav -i input.mkv -q 5 -o output.tav    # Highest quality, largest file
+./encoder_tav_ref -i input.avi -q 0 -o output.tav    # Lowest quality, smallest file
+./encoder_tav_ref -i input.mkv -q 5 -o output.tav    # Highest quality, largest file
 ```
 
 ### Intra-only Encoding
 
 ```bash
 # Enable Intra-only encoding
-./encoder_tav -i input.mp4 --intra-only -o output.tav
+./encoder_tav_ref -i input.mp4 --intra-only -o output.tav
 ```
 
 ### Decoding and Inspection
 
 ```bash
 # Decode TAV to raw video
-./decoder_tav -i input.tav -o output.mkv
+./decoder_tav_ref -i input.tav -o output.mkv
 
 # Inspect packet structure (debugging)
 ./tav_inspector input.tav -v
@@ -111,7 +111,7 @@ Encoding requires FFmpeg executable installed in your system.
 
 ```bash
 # Encode only first N frames (useful for testing)
-./encoder_tav -i input.mp4 -o output.tav --encode-limit 100
+./encoder_tav_ref -i input.mp4 -o output.tav --encode-limit 100
 ```
 
 ## Technical Architecture

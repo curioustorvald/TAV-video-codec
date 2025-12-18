@@ -54,6 +54,7 @@ TAV seamlessly integrates with the TAD (TSVM Advanced Audio) codec for synchroni
 
 - C compiler (GCC/Clang)
 - Zstandard library
+- OpenCV 4 library (only used by experimental motion estimation feature)
 
 ### Compilation
 
@@ -64,17 +65,14 @@ make tav
 # Build all tools including TAD audio codec
 make all
 
-# Build TAV libraries only (libtavenc, libtavdec, libtadenc, libtaddec, libfec)
-make libs
-
 # Clean build artefacts
 make clean
 ```
 
 ### Build Targets
 
-- `encoder_tav_ref` - Reference video encoder
-- `decoder_tav_ref` - Standalone video decoder
+- `encoder_tav` - Main video encoder
+- `decoder_tav` - Standalone video decoder
 - `tav_inspector` - Packet analysis and debugging tool
 
 ## Usage
@@ -85,18 +83,18 @@ Encoding requires FFmpeg executable installed in your system.
 
 ```bash
 # Default encoding (CDF 9/7 wavelet, quality level 3)
-./encoder_tav_ref -i input.mp4 -o output.tav
+./encoder_tav -i input.mp4 -o output.tav
 
 # Quality levels (0-5)
-./encoder_tav_ref -i input.avi -q 0 -o output.tav    # Lowest quality, smallest file
-./encoder_tav_ref -i input.mkv -q 5 -o output.tav    # Highest quality, largest file
+./encoder_tav -i input.avi -q 0 -o output.tav    # Lowest quality, smallest file
+./encoder_tav -i input.mkv -q 5 -o output.tav    # Highest quality, largest file
 ```
 
 ### Intra-only Encoding
 
 ```bash
 # Enable Intra-only encoding
-./encoder_tav_ref -i input.mp4 --intra-only -o output.tav
+./encoder_tav -i input.mp4 --intra-only -o output.tav
 ```
 
 ### Decoding and Inspection
@@ -113,7 +111,7 @@ Encoding requires FFmpeg executable installed in your system.
 
 ```bash
 # Encode only first N frames (useful for testing)
-./encoder_tav_ref -i input.mp4 -o output.tav --encode-limit 100
+./encoder_tav -i input.mp4 -o output.tav --encode-limit 100
 ```
 
 ## Technical Architecture

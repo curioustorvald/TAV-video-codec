@@ -703,7 +703,8 @@ static int init_decoder_threads(decoder_context_t *ctx) {
         .quantiser_co = ctx->header.quantiser_co,
         .quantiser_cg = ctx->header.quantiser_cg,
         .encoder_preset = ctx->header.encoder_preset,
-        .monoblock = 1
+        .monoblock = 1,
+        .no_zstd = (ctx->header.video_flags & 0x10) ? 1 : 0  // Bit 4: no Zstd
     };
 
     for (int i = 0; i < ctx->num_threads; i++) {
@@ -2242,7 +2243,8 @@ int main(int argc, char *argv[]) {
         .quantiser_co = ctx.header.quantiser_co,
         .quantiser_cg = ctx.header.quantiser_cg,
         .encoder_preset = ctx.header.encoder_preset,
-        .monoblock = 1
+        .monoblock = 1,
+        .no_zstd = (ctx.header.video_flags & 0x10) ? 1 : 0  // Bit 4: no Zstd
     };
 
     ctx.video_ctx = tav_video_create(&video_params);

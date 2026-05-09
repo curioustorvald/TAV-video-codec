@@ -197,6 +197,7 @@ typedef struct {
     int is_ntsc_framerate;
     int quality_index;
     int is_pal;
+    int no_zstd;  // 1 = packets stored uncompressed (DT flags bit 3)
 
     // Video decoder context
     tav_video_context_t *video_ctx;
@@ -661,6 +662,7 @@ static int read_and_decode_header(dt_decoder_t *dec, dt_packet_header_t *header)
         dec->framerate = header->framerate;
         dec->is_interlaced = header->flags & 0x01;
         dec->is_ntsc_framerate = header->flags & 0x02;
+        dec->no_zstd = (header->flags & 0x08) ? 1 : 0;  // Bit 3: no Zstd
         dec->quality_index = (header->flags >> 4) & 0x0F;
         if (dec->quality_index > 5) dec->quality_index = 5;
 
@@ -800,6 +802,7 @@ static int init_decoder_threads(dt_decoder_t *dec) {
     vparams.quantiser_cg = QUALITY_CG[dec->quality_index];
     vparams.encoder_preset = 0x01;  // Sports
     vparams.monoblock = 1;
+    vparams.no_zstd = dec->no_zstd;
 
     for (int i = 0; i < dec->num_threads; i++) {
         dec->worker_video_ctx[i] = tav_video_create(&vparams);
@@ -1402,6 +1405,7 @@ static int decode_video_subpacket(dt_decoder_t *dec, const uint8_t *data, size_t
         vparams.quantiser_cg = QUALITY_CG[dec->quality_index];
         vparams.encoder_preset = 0x01;  // Sports
         vparams.monoblock = 1;
+        vparams.no_zstd = dec->no_zstd;
 
         dec->video_ctx = tav_video_create(&vparams);
         if (!dec->video_ctx) {
@@ -2110,7 +2114,6 @@ int main(int argc, char **argv) {
 
     // Initialize FEC libraries
     rs_init();
-    ldpc_init();
     ldpc_p_init();  // LDPC payload codec
 
     static struct option long_options[] = {

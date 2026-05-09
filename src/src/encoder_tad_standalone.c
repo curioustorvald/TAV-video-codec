@@ -55,6 +55,7 @@ static void print_usage(const char *prog_name) {
     printf("                  3 = good quality (max_index=47) [DEFAULT]\n");
     printf("                  4 = high quality (max_index=56)\n");
     printf("                  5 = very high quality/largest (max_index=89)\n");
+    printf("  --zstd-level N  Enable Zstd second-stage compression (1-22). Disabled by default.\n");
     printf("  -v              Verbose output\n");
     printf("  -h, --help      Show this help\n");
     printf("\nVersion: %s\n", ENCODER_VENDOR_STRING);
@@ -70,16 +71,18 @@ int main(int argc, char *argv[]) {
     int quality = TAD32_QUALITY_DEFAULT;  // Default quality level (0-5)
     float quantiser_scale = 1.0f;  // Default quantiser scaling
     int verbose = 0;
+    int zstd_level = -1;  // <0 = disabled (default), >=0 = enable Zstd second-stage
 
     // Parse command line arguments
     static struct option long_options[] = {
-        {"help", no_argument, 0, 'h'},
+        {"help",       no_argument,       0, 'h'},
+        {"zstd-level", required_argument, 0, 'Z'},
         {0, 0, 0, 0}
     };
 
     int opt;
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "i:o:q:s:vh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:o:q:s:vhZ:", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'i':
                 input_file = optarg;
@@ -103,6 +106,9 @@ int main(int argc, char *argv[]) {
                 break;
             case 'v':
                 verbose = 1;
+                break;
+            case 'Z':
+                zstd_level = atoi(optarg);
                 break;
             case 'h':
                 print_usage(argv[0]);
@@ -289,7 +295,7 @@ int main(int argc, char *argv[]) {
         // Encode chunk using linked tad32_encode_chunk() from encoder_tad32.c
         size_t encoded_size = tad32_encode_chunk(chunk_buffer, TAD32_DEFAULT_CHUNK_SIZE,
                                                  max_index,
-                                                 quantiser_scale, TAD32_ZSTD_LEVEL, output_buffer);
+                                                 quantiser_scale, zstd_level, output_buffer);
 
         if (encoded_size == 0) {
             fprintf(stderr, "Error: Chunk encoding failed at chunk %zu\n", chunk_idx);

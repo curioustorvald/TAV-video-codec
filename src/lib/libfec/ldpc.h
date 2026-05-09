@@ -25,13 +25,6 @@
 #define LDPC_MAX_ITERATIONS 50
 
 /**
- * Initialize LDPC codec.
- * Must be called once before using encode/decode functions.
- * Thread-safe: uses static initialization.
- */
-void ldpc_init(void);
-
-/**
  * Encode data block with LDPC rate 1/2.
  *
  * @param data      Input data bytes

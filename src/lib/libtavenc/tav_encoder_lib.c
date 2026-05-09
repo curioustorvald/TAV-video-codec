@@ -300,7 +300,7 @@ void tav_encoder_params_init(tav_encoder_params_t *params, int width, int height
 
     // Compression
     params->entropy_coder = 1;         // EZBC as default
-    params->zstd_level = 7;            // Balanced compression/speed
+    params->zstd_level = -1;            // Disable Zstd
 
     // Threading
     params->num_threads = 0;           // Single-threaded (multi-threading not yet implemented)

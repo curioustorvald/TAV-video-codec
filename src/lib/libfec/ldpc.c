@@ -118,24 +118,10 @@ static int get_data_connections(int data_idx, int k_bits, int *connections) {
 }
 
 // =============================================================================
-// Initialization
-// =============================================================================
-
-static int ldpc_initialized = 0;
-
-void ldpc_init(void) {
-    if (ldpc_initialized) return;
-    // No pre-computation needed - patterns generated on the fly
-    ldpc_initialized = 1;
-}
-
-// =============================================================================
 // Encoding
 // =============================================================================
 
 size_t ldpc_encode(const uint8_t *data, size_t data_len, uint8_t *output) {
-    if (!ldpc_initialized) ldpc_init();
-
     if (data_len > LDPC_MAX_DATA_BYTES) {
         data_len = LDPC_MAX_DATA_BYTES;
     }
@@ -172,8 +158,6 @@ size_t ldpc_encode(const uint8_t *data, size_t data_len, uint8_t *output) {
 // =============================================================================
 
 int ldpc_check_syndrome(const uint8_t *codeword, size_t len) {
-    if (!ldpc_initialized) ldpc_init();
-
     size_t data_len = len / 2;
     int k_bits = (int)(data_len * 8);
 
@@ -209,8 +193,6 @@ static inline float sign_f(float x) {
 }
 
 int ldpc_decode(const uint8_t *encoded, size_t encoded_len, uint8_t *output) {
-    if (!ldpc_initialized) ldpc_init();
-
     if (encoded_len < 2 || (encoded_len & 1) != 0) {
         return -1;  // Invalid length
     }

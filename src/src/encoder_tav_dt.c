@@ -212,6 +212,7 @@ typedef struct {
     int verbose;
     int encode_limit;
     int fec_mode;                // FEC_MODE_RS or FEC_MODE_LDPC for payloads
+    int zstd_level;              // <0 = disabled (default), >=0 = Zstd second-stage compression
 
     // Multithreading
     int num_threads;             // 0 = single-threaded, 1+ = num worker threads
@@ -244,6 +245,7 @@ static void print_usage(const char *program) {
     printf("  --interlaced         Interlaced output\n");
     printf("  --ldpc-payload       Use LDPC(255,223) instead of RS(255,223) for payloads\n");
     printf("                       (experimental: better at high error rates)\n");
+    printf("  --zstd-level N       Enable Zstd second-stage compression (3-22). Disabled by default.\n");
     printf("  --encode-limit N     Encode only N frames (for testing)\n");
     printf("  -t, --threads N      Parallel encoding threads (default: min(8, available CPUs))\n");
     printf("                       0 or 1 = single-threaded, 2-16 = multithreaded\n");
@@ -331,10 +333,13 @@ static int write_packet(dt_encoder_t *enc, uint64_t timecode_ns,
     header[0] = fps_byte;
 
     // Flags byte
+    // Bit 0 = interlaced, Bit 1 = NTSC framerate, Bit 2 = FEC mode,
+    // Bit 3 = no Zstd second-stage compression, Bits 4-7 = quality
     uint8_t flags = 0;
     flags |= (enc->is_interlaced ? 0x01 : 0x00);
     flags |= (enc->fps_den == 1001 ? 0x02 : 0x00);
     flags |= ((enc->fec_mode & 0x01) << 2);  // FEC mode in bit 2
+    flags |= (enc->zstd_level < 0 ? 0x08 : 0x00);  // Bit 3: no Zstd
     flags |= (enc->quality_index & 0x0F) << 4;
     header[1] = flags;
 
@@ -1233,7 +1238,7 @@ static int run_encoder(dt_encoder_t *enc) {
     enc->enc_params.encoder_preset = 0x01;      // Sports mode
     enc->enc_params.monoblock = 1;              // Force monoblock
     enc->enc_params.verbose = enc->verbose;
-    enc->enc_params.zstd_level = -1; // disable Zstd
+    enc->enc_params.zstd_level = enc->zstd_level; // -1 = disabled (default), >=0 = enable
 
     // For single-threaded mode, create a context to validate params
     enc->video_ctx = tav_encoder_create(&enc->enc_params);
@@ -1347,10 +1352,10 @@ int main(int argc, char **argv) {
     enc.is_pal = 0;
     enc.is_interlaced = 0;
     enc.num_threads = get_default_thread_count();  // Default: min(8, available CPUs)
+    enc.zstd_level = -1;  // Disabled by default; --zstd-level enables it
 
     // Initialize FEC libraries
     rs_init();
-    ldpc_init();
     ldpc_p_init();  // LDPC payload codec
 
     static struct option long_options[] = {
@@ -1363,6 +1368,7 @@ int main(int argc, char **argv) {
         {"pal",          no_argument,       0, 'P'},
         {"interlaced",   no_argument,       0, 'I'},
         {"ldpc-payload", no_argument,       0, 'D'},
+        {"zstd-level",   required_argument, 0, 'Z'},
         {"encode-limit", required_argument, 0, 'L'},
         {"verbose",      no_argument,       0, 'v'},
         {"help",         no_argument,       0, 'h'},
@@ -1370,7 +1376,7 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:o:q:f:t:vhNPI", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:o:q:f:t:vhNPIZ:", long_options, NULL)) != -1) {
         switch (opt) {
             case 'i':
                 enc.input_file = optarg;
@@ -1419,6 +1425,9 @@ int main(int argc, char **argv) {
                 break;
             case 'D':
                 enc.fec_mode = FEC_MODE_LDPC;
+                break;
+            case 'Z':
+                enc.zstd_level = atoi(optarg);
                 break;
             case 'L':
                 enc.encode_limit = atoi(optarg);

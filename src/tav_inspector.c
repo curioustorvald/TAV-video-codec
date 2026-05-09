@@ -391,7 +391,8 @@ typedef struct {
 
 // Read frame mode and quantiser from compressed frame data
 // Works for both I-frames and P-frames
-frame_info_t get_frame_info(FILE *fp, uint32_t compressed_size) {
+// no_zstd: 1 if packets are stored uncompressed (Video Flags bit 4)
+frame_info_t get_frame_info(FILE *fp, uint32_t compressed_size, int no_zstd) {
     frame_info_t info = {-1, 0xFF};
 
     // Read compressed data
@@ -406,22 +407,30 @@ frame_info_t get_frame_info(FILE *fp, uint32_t compressed_size) {
         return info;
     }
 
-    // Allocate buffer for decompression
-    // TAV frames are at most ~1.5MB decompressed, use 2MB to be safe
-    size_t const decompress_size = 2 * 1024 * 1024;  // 2MB
-    uint8_t *decompressed_data = malloc(decompress_size);
-    if (!decompressed_data) {
+    uint8_t *decompressed_data;
+    size_t actual_size;
+
+    if (no_zstd) {
+        // Packets stored uncompressed - use directly
+        decompressed_data = compressed_data;
+        actual_size = compressed_size;
+    } else {
+        // Allocate buffer for Zstd decompression
+        // TAV frames are at most ~1.5MB decompressed, use 2MB to be safe
+        size_t const decompress_size = 2 * 1024 * 1024;  // 2MB
+        decompressed_data = malloc(decompress_size);
+        if (!decompressed_data) {
+            free(compressed_data);
+            return info;
+        }
+
+        actual_size = ZSTD_decompress(decompressed_data, decompress_size, compressed_data, compressed_size);
         free(compressed_data);
-        return info;
-    }
 
-    // Decompress
-    size_t actual_size = ZSTD_decompress(decompressed_data, decompress_size, compressed_data, compressed_size);
-    free(compressed_data);
-
-    if (ZSTD_isError(actual_size) || actual_size < 2) {
-        free(decompressed_data);
-        return info;
+        if (ZSTD_isError(actual_size) || actual_size < 2) {
+            free(decompressed_data);
+            return info;
+        }
     }
 
     // Read mode byte (first byte of decompressed data)
@@ -529,6 +538,7 @@ int main(int argc, char *argv[]) {
     uint8_t dt_quality = 0;
     int dt_is_interlaced = 0;
     int dt_is_ntsc_framerate = 0;
+    int no_zstd = 0;  // 1 = packets stored uncompressed (Video Flags bit 4 / DT flags bit 3)
 
     // Read first 4 bytes to check format
     uint8_t format_check[4];
@@ -549,9 +559,6 @@ int main(int argc, char *argv[]) {
         dt_width = 720;
         dt_height = (sync == TAV_DT_SYNC_NTSC) ? 480 : 576;
 
-        // Initialize LDPC decoder
-        ldpc_init();
-
         // Read LDPC-coded main header (56 bytes)
         uint8_t ldpc_header[DT_MAIN_HEADER_LDPC];
         if (fread(ldpc_header, 1, DT_MAIN_HEADER_LDPC, fp) != DT_MAIN_HEADER_LDPC) {
@@ -570,6 +577,7 @@ int main(int argc, char *argv[]) {
         uint8_t flags = raw_header[1];
         dt_is_interlaced = flags & 0x01;
         dt_is_ntsc_framerate = flags & 0x02;
+        no_zstd = (flags & 0x08) ? 1 : 0;  // DT flags bit 3
         dt_quality = (flags >> 4) & 0x0F;
 
         uint32_t packet_size = raw_header[4] | (raw_header[5] << 8) |
@@ -630,6 +638,9 @@ int main(int argc, char *argv[]) {
             fclose(fp);
             return 1;
         }
+
+        // Pick up no_zstd from Video Flags bit 4 even in summary mode
+        no_zstd = (header[24] & 0x10) ? 1 : 0;
     }
 
     if (!opts.summary_only && !is_dt_format) {
@@ -712,6 +723,7 @@ static const char* TEMPORAL_WAVELET[] = {"Haar", "CDF 5/3"};
         printf("    Has subtitles:  %s\n", (extra_flags & 0x02) ? "Yes" : "No");
         printf("    Progressive:    %s\n", (video_flags & 0x01) ? "No (interlaced)" : "Yes");
         printf("    Lossless:       %s\n", (video_flags & 0x04) ? "Yes" : "No");
+        printf("    Zstd:           %s\n", (video_flags & 0x10) ? "No (raw packets)" : "Yes");
         if (extra_flags & 0x04) printf("    Progressive TX: Enabled\n");
         if (extra_flags & 0x08) printf("    ROI encoding:   Enabled\n");
         printf("\nPackets:\n");
@@ -969,7 +981,7 @@ static const char* TEMPORAL_WAVELET[] = {"Haar", "CDF 5/3"};
                 stats.total_video_bytes += size;
 
                 // Get frame info (mode and quantiser) for both I-frames and P-frames
-                frame_info_t frame_info = get_frame_info(fp, size);
+                frame_info_t frame_info = get_frame_info(fp, size, no_zstd);
 
                 if (packet_type == TAV_PACKET_PFRAME ||
                     (packet_type >= 0x71 && packet_type <= 0x7F && (packet_type & 1))) {
@@ -1068,16 +1080,20 @@ static const char* TEMPORAL_WAVELET[] = {"Haar", "CDF 5/3"};
                 uint8_t quantiser;
                 if (read_packet_data(&quantiser, sizeof(uint8_t), 1, fp, packet_payload, payload_size, &payload_offset) != 1) break;
 
-                // Read compressed size
-                uint32_t compressed_size;
-                if (read_packet_data(&compressed_size, sizeof(uint32_t), 1, fp, packet_payload, payload_size, &payload_offset) != 1) break;
+                // Read payload size; MSB=1 means TAD payload is stored uncompressed
+                uint32_t compressed_size_field;
+                if (read_packet_data(&compressed_size_field, sizeof(uint32_t), 1, fp, packet_payload, payload_size, &payload_offset) != 1) break;
+                int tad_uncompressed = (compressed_size_field & 0x80000000U) != 0;
+                uint32_t compressed_size = compressed_size_field & 0x7FFFFFFFU;
 
                 stats.total_audio_bytes += compressed_size;
                 stats.audio_tad_bytes += compressed_size;
 
                 if (!opts.summary_only && display) {
-                    printf(" - samples=%u, size=%u bytes, quantiser=%u steps (index %u)",
-                           sample_count, compressed_size, quantiser * 2 + 1, quantiser);
+                    printf(" - samples=%u, size=%u bytes%s, quantiser=%u steps (index %u)",
+                           sample_count, compressed_size,
+                           tad_uncompressed ? " (raw)" : " (zstd)",
+                           quantiser * 2 + 1, quantiser);
                 }
 
                 // Skip compressed data

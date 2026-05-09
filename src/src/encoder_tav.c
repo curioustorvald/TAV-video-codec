@@ -381,7 +381,7 @@ static void print_usage(const char *program) {
 //           TAV_MONOBLOCK_MAX_WIDTH, TAV_MONOBLOCK_MAX_HEIGHT);
 //    printf("  --tiled                  Force multi-tile mode (Padded Tiling)\n");
     printf("\nCompression:\n");
-    printf("  --zstd-level N           Zstd level 3-22 (default: 7)\n");
+    printf("  --zstd-level N           Enable Zstd second-stage compression (3-22). Disabled by default.\n");
     printf("  --no-perceptual-tuning   Disable HVS perceptual quantization\n");
     printf("  --no-dead-zone           Disable dead-zone quantization\n");
     printf("  --dead-zone-threshold N  Dead-zone threshold. Defaults by quality level:\n");
@@ -744,9 +744,11 @@ static int write_tav_header(FILE *fp, const tav_encoder_params_t *params,
     fputc(extra_flags, fp);
 
     // Video flags (uint8_t, 1 byte)
-    // Bit 0 = interlaced, Bit 1 = NTSC framerate, Bit 2 = lossless, etc.
+    // Bit 0 = interlaced, Bit 1 = NTSC framerate, Bit 2 = lossless,
+    // Bit 4 = no Zstd second-stage compression (packets stored uncompressed)
     uint8_t video_flags = 0;
     if (interlaced) video_flags |= 0x01;  // Bit 0: interlaced
+    if (params->zstd_level < 0) video_flags |= 0x10;  // Bit 4: no Zstd
     fputc(video_flags, fp);
 
     // Quality level (uint8_t, 1 byte)
@@ -1058,17 +1060,15 @@ static int write_audio_packet(FILE *fp, cli_context_t *cli, float *pcm_samples, 
 
     // Extract TAD chunk header
     uint16_t sample_count;
-    uint8_t quantiser_bits;
-    uint32_t compressed_size;
     memcpy(&sample_count, tad_buffer, 2);
-    memcpy(&quantiser_bits, tad_buffer + 2, 1);
-    memcpy(&compressed_size, tad_buffer + 3, 4);
 
     // Write TAV packet header
     fputc(TAV_PACKET_AUDIO_TAD, fp);                        // Packet type (0x24)
     fwrite(&sample_count, 2, 1, fp);                         // Sample count
-    uint32_t packet_payload_size = compressed_size + 7;      // TAD chunk size
-    fwrite(&packet_payload_size, 4, 1, fp);                  // Compressed size + 7
+    // Whole TAD chunk size (header + payload). Using tad_chunk_size avoids leaking
+    // the TAD MSB uncompressed-flag from the inner compressed_size field.
+    uint32_t packet_payload_size = (uint32_t)tad_chunk_size;
+    fwrite(&packet_payload_size, 4, 1, fp);                  // TAD chunk size
 
     // Write TAD chunk (sample_count, quantiser_bits, compressed_size, payload)
     fwrite(tad_buffer, 1, tad_chunk_size, fp);

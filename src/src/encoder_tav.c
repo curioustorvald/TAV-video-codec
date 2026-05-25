@@ -517,8 +517,8 @@ static int is_input_still_image(const char *input_file) {
     }
     pclose(fp);
 
-    // Check if nb_frames is exactly "1" or "N/A"
-    // Also check if duration is very short (< 0.1 seconds) or N/A
+    // Check if nb_frames is exactly "1"
+    // Also check if duration is very short (< 0.1 seconds)
     if (nb_frames_str[0]) {
         // Remove trailing newline
         char *nl = strchr(nb_frames_str, '\n');
@@ -526,9 +526,8 @@ static int is_input_still_image(const char *input_file) {
         nl = strchr(duration_str, '\n');
         if (nl) *nl = '\0';
 
-        // Still image if nb_frames is "1" or "N/A"
-        if (strcmp(nb_frames_str, "1") == 0 ||
-            strcmp(nb_frames_str, "N/A") == 0) {
+        // Still image if nb_frames is "1"
+        if (strcmp(nb_frames_str, "1") == 0) {
             return 1;
         }
 
